@@ -44,7 +44,6 @@ def get_stock_data(symbol):
         }
         
     except Exception as e:
-        print(f"{Fore.RED}Error fetching data: {e}")
         return None
 
 
@@ -59,60 +58,68 @@ def format_number(num):
         return f"{num:.2f}"
 
 
-def display_stock_data(data):
+def display_header():
+    print(f"\n{Fore.CYAN}{'=' * 90}")
+    print(f"{Fore.WHITE}{Style.BRIGHT}{'STOCK MARKET MONITOR':^90}")
+    print(f"{Fore.CYAN}{'=' * 90}")
+    print(f"{Fore.WHITE}Last Update: {Fore.YELLOW}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{Fore.CYAN}{'-' * 90}\n")
+
+
+def display_table_header():
+    headers = ['Symbol', 'Price', 'Change', '% Change', 'Volume', 'Day Range', 'Current Position']
+    widths = [8, 10, 10, 10, 12, 20, 20]
+    
+    header_line = ""
+    for header, width in zip(headers, widths):
+        header_line += f"{Fore.WHITE}{Style.BRIGHT}{header:^{width}}"
+    
+    print(header_line)
+    print(f"{Fore.CYAN}{'-' * 90}")
+
+
+def display_stock_row(data):
     if not data:
-        print(f"{Fore.RED}Unable to fetch stock data")
         return
     
     is_up = data['change'] >= 0
     color = Fore.GREEN if is_up else Fore.RED
     arrow = "^" if is_up else "v"
     
-    clear_screen()
-    
-    print(f"\n{Fore.CYAN}{'=' * 60}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}  STOCK PRICE MONITOR - {data['symbol']}")
-    print(f"{Fore.CYAN}{'=' * 60}\n")
-    
-    print(f"{Fore.WHITE}  Last Update: {Fore.YELLOW}{data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"\n{Fore.CYAN}{'-' * 60}\n")
-    
-    print(f"{Fore.WHITE}  Current Price:     {Style.BRIGHT}{color}${data['current_price']:.2f}")
-    print(f"{Fore.WHITE}  Previous Close:    ${data['previous_close']:.2f}")
-    print()
+    # Format values
+    symbol = f"{Fore.WHITE}{Style.BRIGHT}{data['symbol']:<8}"
+    price = f"{Fore.WHITE}${data['current_price']:>8.2f}"
     
     change_sign = "+" if is_up else ""
-    print(f"{Fore.WHITE}  Change:           {color}{arrow} {change_sign}${abs(data['change']):.2f} ({change_sign}{data['change_percent']:.2f}%)")
-    print()
+    change = f"{color}{arrow} {change_sign}${abs(data['change']):>6.2f}"
+    percent = f"{color}{change_sign}{data['change_percent']:>6.2f}%"
     
-    print(f"{Fore.WHITE}  Day Range:        ${data['day_low']:.2f} - ${data['day_high']:.2f}")
-    print(f"{Fore.WHITE}  Volume:           {format_number(data['volume'])}")
+    volume = f"{Fore.WHITE}{format_number(data['volume']):>12}"
+    day_range = f"{Fore.WHITE}${data['day_low']:.2f}-${data['day_high']:.2f}"
     
-    print(f"\n{Fore.CYAN}{'-' * 60}")
-    
-    day_range = data['day_high'] - data['day_low']
-    if day_range > 0:
-        position = (data['current_price'] - data['day_low']) / day_range
-        bar_length = 40
+    # Calculate position in day range
+    day_range_val = data['day_high'] - data['day_low']
+    if day_range_val > 0:
+        position = (data['current_price'] - data['day_low']) / day_range_val
+        bar_length = 15
         filled = int(position * bar_length)
-        
-        print(f"\n{Fore.WHITE}  Day Range Progress:")
-        print(f"  Low ${data['day_low']:.2f} ", end="")
-        print(f"{Fore.BLUE}[", end="")
-        print(f"{color}{'#' * filled}", end="")
-        print(f"{Fore.WHITE}{'-' * (bar_length - filled)}", end="")
-        print(f"{Fore.BLUE}]", end="")
-        print(f" High ${data['day_high']:.2f}")
+        position_bar = f"{Fore.BLUE}[{color}{'#' * filled}{Fore.WHITE}{'-' * (bar_length - filled)}{Fore.BLUE}]"
+    else:
+        position_bar = f"{Fore.BLUE}[{Fore.WHITE}{'-' * 15}{Fore.BLUE}]"
     
-    print(f"\n{Fore.CYAN}{'=' * 60}\n")
+    print(f"{symbol} {price} {change} {percent} {volume} {day_range:<20} {position_bar}")
+
+
+def display_footer():
+    print(f"\n{Fore.CYAN}{'=' * 90}\n")
 
 
 def main():
-    symbol = "AAPL"
+    symbols = ["AAPL", "TSLA", "NVDA", "SPY"]
     update_interval = 30
     
-    print(f"{Fore.CYAN}{Style.BRIGHT}Starting Stock Price Monitor")
-    print(f"{Fore.WHITE}Monitoring: {Fore.YELLOW}{symbol}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}Starting Stock Market Monitor")
+    print(f"{Fore.WHITE}Monitoring: {Fore.YELLOW}{', '.join(symbols)}")
     print(f"{Fore.WHITE}Update Interval: {Fore.YELLOW}{update_interval} seconds")
     print(f"{Fore.WHITE}Press {Fore.RED}Ctrl+C{Fore.WHITE} to stop\n")
     
@@ -120,13 +127,22 @@ def main():
     
     try:
         while True:
-            data = get_stock_data(symbol)
-            display_stock_data(data)
+            clear_screen()
+            display_header()
+            display_table_header()
             
-            print(f"{Fore.WHITE}  Next update in {update_interval} seconds...")
+            # Fetch and display data for all stocks
+            for symbol in symbols:
+                data = get_stock_data(symbol)
+                display_stock_row(data)
             
+            display_footer()
+            
+            print(f"{Fore.WHITE}Next update in {update_interval} seconds...")
+            
+            # Countdown timer
             for i in range(update_interval, 0, -1):
-                print(f"\r{Fore.WHITE}  Next update in {i} seconds...  ", end="", flush=True)
+                print(f"\r{Fore.WHITE}Next update in {i} seconds...  ", end="", flush=True)
                 time.sleep(1)
                 
     except KeyboardInterrupt:
