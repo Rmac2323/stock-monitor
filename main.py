@@ -26,6 +26,12 @@ from rich import box
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.columns import Columns
 from rich.prompt import Prompt
+from news_fetcher import NewsFetcher
+try:
+    from edgar_scraper_selenium import EdgarScraperSelenium as EdgarScraper
+except ImportError:
+    # Fallback to simple scraper if Selenium fails
+    from edgar_scraper_simple import EdgarScraper
 
 console = Console()
 
@@ -672,6 +678,114 @@ def create_stock_tables(stocks_data):
     return price_table, tech_table
 
 
+def create_edgar_table(stocks_data):
+    """Create table with Edgar risk data"""
+    edgar_table = Table(
+        title="Risk Analysis (Edgar.io)",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold red",
+        title_style="bold white"
+    )
+    
+    edgar_table.add_column("Symbol", style="bold white", width=8)
+    edgar_table.add_column("Overall Risk", justify="center", width=12)
+    edgar_table.add_column("Offering Ability", justify="center", width=14)
+    edgar_table.add_column("Dilution Risk", justify="center", width=12)
+    edgar_table.add_column("Cash Need", justify="center", width=12)
+    edgar_table.add_column("Off. Frequency", justify="center", width=12)
+    edgar_table.add_column("Reg SHO", justify="center", width=8)
+    
+    # Risk color mapping
+    risk_colors = {
+        'HIGH': 'red bold',
+        'MEDIUM': 'yellow',
+        'LOW': 'green',
+        'UNKNOWN': 'dim white',
+        'N/A': 'dim white'
+    }
+    
+    for data in stocks_data:
+        if not data or 'status' in data and data['status'] != 'OK':
+            continue
+            
+        edgar_risk = data.get('edgar_risk', {})
+        
+        # Format risk levels with color
+        def format_risk(risk_level):
+            color = risk_colors.get(risk_level.upper() if risk_level else 'UNKNOWN', 'white')
+            return f"[{color}]{risk_level or 'N/A'}[/{color}]"
+        
+        # RegSHO indicator
+        reg_sho = edgar_risk.get('reg_sho', False)
+        reg_sho_str = "[red bold]YES[/red bold]" if reg_sho else "[green]NO[/green]"
+        
+        edgar_table.add_row(
+            data['symbol'],
+            format_risk(edgar_risk.get('overall_risk')),
+            format_risk(edgar_risk.get('offering_ability')),
+            format_risk(edgar_risk.get('dilution_risk')),
+            format_risk(edgar_risk.get('cash_need_risk')),
+            format_risk(edgar_risk.get('offering_frequency')),
+            reg_sho_str
+        )
+    
+    return edgar_table
+
+
+def create_news_panel(symbol, news_items):
+    """Create a panel with recent news for a stock"""
+    if not news_items:
+        return None
+    
+    news_text = Text()
+    news_text.append(f"Recent News for {symbol}\n", style="bold cyan")
+    
+    for i, article in enumerate(news_items[:3]):  # Show top 3 news items
+        # Format timestamp
+        pub_time = article.get('published_at', '')
+        if pub_time:
+            try:
+                dt = datetime.fromisoformat(pub_time.replace('Z', '+00:00'))
+                time_diff = datetime.now(dt.tzinfo) - dt
+                if time_diff.days > 0:
+                    time_str = f"{time_diff.days}d ago"
+                elif time_diff.seconds > 3600:
+                    time_str = f"{time_diff.seconds // 3600}h ago"
+                else:
+                    time_str = f"{time_diff.seconds // 60}m ago"
+            except:
+                time_str = "N/A"
+        else:
+            time_str = "N/A"
+        
+        # Sentiment color
+        sentiment = article.get('sentiment', 'neutral')
+        sentiment_colors = {
+            'positive': 'green',
+            'negative': 'red',
+            'neutral': 'yellow'
+        }
+        sentiment_color = sentiment_colors.get(sentiment, 'white')
+        
+        # Add news item
+        news_text.append(f"\n[{sentiment_color}]● [{time_str}][/{sentiment_color}] ", style="dim")
+        news_text.append(f"{article.get('title', 'No title')[:80]}...\n", style="white")
+        news_text.append(f"  Source: {article.get('source', 'Unknown')}", style="dim cyan")
+        
+        if i < len(news_items) - 1:
+            news_text.append("\n", style="")
+    
+    return Panel(
+        news_text,
+        box=box.ROUNDED,
+        border_style="cyan",
+        padding=(0, 1),
+        title=f"[bold]{symbol} News[/bold]",
+        title_align="left"
+    )
+
+
 def create_header():
     """Create a header panel with current time"""
     now = datetime.now()
@@ -1012,6 +1126,19 @@ def main():
     alerts = load_alerts()
     triggered_alerts = set()  # Track already triggered alerts
     
+    # Initialize news and Edgar data fetchers
+    news_config = config.get('news', {})
+    edgar_config = config.get('edgar', {})
+    
+    news_fetcher = NewsFetcher(api_key=news_config.get('newsapi_key')) if news_config.get('enabled', True) else None
+    edgar_scraper = EdgarScraper() if edgar_config.get('enabled', True) else None
+    
+    # Track last update times for news and Edgar data
+    last_news_update = {}
+    last_edgar_update = datetime.min
+    news_data = {}
+    edgar_data = {}
+    
     symbols = config.get('stocks', ["AAPL", "GOOGL", "MSFT"])
     update_interval = config.get('update_interval', 5)
     logging_enabled = config.get('logging', {}).get('enabled', True)
@@ -1180,6 +1307,30 @@ def main():
             # Clear screen and fetch data
             console.clear()
             
+            # Fetch Edgar data if it's time to update
+            if edgar_scraper:
+                edgar_interval = edgar_config.get('update_interval', 1800)  # 30 minutes default
+                if (datetime.now() - last_edgar_update).total_seconds() > edgar_interval or force_refresh:
+                    try:
+                        console.print("[yellow]Fetching Edgar risk data...[/yellow]")
+                        edgar_data = edgar_scraper.fetch_edgar_data()
+                        last_edgar_update = datetime.now()
+                    except Exception as e:
+                        log_error(f"Failed to fetch Edgar data: {e}", console_output=False)
+            
+            # Fetch news data if it's time to update
+            if news_fetcher:
+                news_interval = news_config.get('update_interval', 3600)  # 1 hour default
+                for symbol in symbols:
+                    if symbol not in last_news_update or \
+                       (datetime.now() - last_news_update.get(symbol, datetime.min)).total_seconds() > news_interval or \
+                       force_refresh:
+                        try:
+                            news_data[symbol] = news_fetcher.fetch_stock_news(symbol)
+                            last_news_update[symbol] = datetime.now()
+                        except Exception as e:
+                            log_error(f"Failed to fetch news for {symbol}: {e}", console_output=False)
+            
             # Fetch and display data for all stocks
             all_alerts = []
             stocks_data = []
@@ -1197,6 +1348,13 @@ def main():
                     progress.update(task, advance=1, description=f"[cyan]Fetching {symbol}...")
                     timeframes = config.get('timeframes', None)
                     data = get_stock_data(symbol, timeframes=timeframes)
+                    
+                    # Add Edgar risk data if available
+                    if edgar_scraper and edgar_data:
+                        risk_data = edgar_data.get(symbol, {})
+                        if risk_data:
+                            data['edgar_risk'] = risk_data
+                    
                     stocks_data.append(data)
                     
                     # Track errors
@@ -1225,6 +1383,26 @@ def main():
             console.print(price_table)
             console.print("")  # Space between tables
             console.print(tech_table)
+            
+            # Display Edgar risk table if available
+            if edgar_scraper and edgar_data:
+                console.print("")  # Space before Edgar table
+                edgar_table = create_edgar_table(stocks_data)
+                console.print(edgar_table)
+            
+            # Display news panels for each stock
+            if news_fetcher and news_data:
+                console.print("")  # Space before news
+                news_panels = []
+                for symbol in symbols[:3]:  # Show news for first 3 stocks to avoid clutter
+                    if symbol in news_data and news_data[symbol]:
+                        panel = create_news_panel(symbol, news_data[symbol])
+                        if panel:
+                            news_panels.append(panel)
+                
+                if news_panels:
+                    # Display news panels in columns
+                    console.print(Columns(news_panels, equal=True, expand=True))
             
             # Display status bar
             last_update = datetime.now()

@@ -2,7 +2,8 @@
     "stocks": [
         "AAPL",
         "GOOGL",
-        "MSFT"
+        "MSFT",
+        "SMXT"
     ],
     "update_interval": 5,
     "timeframes": {
@@ -35,5 +36,20 @@
         "open_time": "09:30",
         "close_time": "16:00",
         "monitor_outside_hours": false
+    },
+    "news": {
+        "enabled": true,
+        "update_interval": 3600,
+        "newsapi_key": null,
+        "sources": [
+            "yahoo",
+            "google",
+            "newsapi"
+        ]
+    },
+    "edgar": {
+        "enabled": true,
+        "update_interval": 1800,
+        "url": "https://app.askedgar.io/gainers"
     }
 }

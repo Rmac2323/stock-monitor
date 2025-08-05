@@ -23,3 +23,8 @@ tzdata==2025.2
 urllib3==2.5.0
 websockets==15.0.1
 yfinance==0.2.65
+rich==13.7.1
+newsapi-python==0.2.7
+selenium==4.18.1
+webdriver-manager==4.0.1
+feedparser==6.0.11
