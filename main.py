@@ -14,6 +14,7 @@ import urllib.error
 import threading
 import queue
 import msvcrt  # Windows keyboard input
+import traceback
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
@@ -64,17 +65,170 @@ def calculate_rsi(prices, period=14):
     return rsi
 
 
-def log_error(error_msg, error_log_file='error_log.txt'):
-    """Log errors to file with timestamp"""
+def calculate_vwap(df):
+    """Calculate Volume Weighted Average Price for the day"""
+    if df.empty or len(df) == 0:
+        return None
+    
+    # Get today's data only
+    today = df.index[-1].date()
+    today_data = df[df.index.date == today]
+    
+    if today_data.empty:
+        return None
+    
+    # Calculate typical price (high + low + close) / 3
+    typical_price = (today_data['High'] + today_data['Low'] + today_data['Close']) / 3
+    
+    # Calculate VWAP
+    cumulative_tpv = (typical_price * today_data['Volume']).cumsum()
+    cumulative_volume = today_data['Volume'].cumsum()
+    
+    if cumulative_volume.iloc[-1] == 0:
+        return None
+    
+    vwap = cumulative_tpv.iloc[-1] / cumulative_volume.iloc[-1]
+    return vwap
+
+
+def calculate_trend_strength(prices, period=20):
+    """Calculate trend strength using linear regression slope"""
+    if len(prices) < period:
+        return None, None
+    
+    recent_prices = prices[-period:]
+    x = np.arange(len(recent_prices))
+    
+    # Calculate linear regression
+    slope, intercept = np.polyfit(x, recent_prices, 1)
+    
+    # Calculate R-squared for trend strength
+    y_pred = slope * x + intercept
+    ss_tot = np.sum((recent_prices - np.mean(recent_prices))**2)
+    ss_res = np.sum((recent_prices - y_pred)**2)
+    
+    if ss_tot == 0:
+        r_squared = 0
+    else:
+        r_squared = 1 - (ss_res / ss_tot)
+    
+    # Normalize slope relative to price
+    normalized_slope = (slope / np.mean(recent_prices)) * 100
+    
+    # Trend strength from 0-100
+    trend_strength = abs(r_squared) * 100
+    
+    return normalized_slope, trend_strength
+
+
+def identify_bar_pattern(open_price, high, low, close, prev_close=None):
+    """Identify common candlestick patterns"""
+    body = abs(close - open_price)
+    upper_shadow = high - max(close, open_price)
+    lower_shadow = min(close, open_price) - low
+    total_range = high - low
+    
+    if total_range == 0:
+        return "Neutral"
+    
+    body_ratio = body / total_range
+    
+    # Doji - very small body
+    if body_ratio < 0.1:
+        if upper_shadow > body * 2 and lower_shadow > body * 2:
+            return "Doji"
+        elif upper_shadow > body * 3:
+            return "Gravestone"
+        elif lower_shadow > body * 3:
+            return "Dragonfly"
+    
+    # Hammer or Shooting Star
+    if body_ratio < 0.3:
+        if lower_shadow > body * 2 and upper_shadow < body * 0.5:
+            return "Hammer" if close > open_price else "InvHammer"
+        elif upper_shadow > body * 2 and lower_shadow < body * 0.5:
+            return "Shooting Star"
+    
+    # Marubozu - no or very small shadows
+    if body_ratio > 0.9:
+        return "Bullish Marubozu" if close > open_price else "Bearish Marubozu"
+    
+    # Engulfing patterns (needs previous candle)
+    if prev_close is not None:
+        if close > open_price and open_price < prev_close and close > prev_close:
+            return "Bullish Engulf"
+        elif close < open_price and open_price > prev_close and close < prev_close:
+            return "Bearish Engulf"
+    
+    return "Normal"
+
+
+def calculate_support_resistance(df, lookback=20):
+    """Calculate support and resistance levels using recent highs/lows"""
+    if len(df) < lookback:
+        return None, None
+    
+    recent_data = df.tail(lookback)
+    
+    # Find local highs and lows
+    highs = recent_data['High'].values
+    lows = recent_data['Low'].values
+    
+    # Simple method: use recent peaks and troughs
+    # Resistance: highest high in the period
+    resistance = np.max(highs)
+    
+    # Support: lowest low in the period
+    support = np.min(lows)
+    
+    # More sophisticated: find levels that were tested multiple times
+    # Group prices into bins and find most frequent levels
+    all_prices = np.concatenate([highs, lows])
+    hist, bins = np.histogram(all_prices, bins=10)
+    
+    # Find the two most frequent price levels
+    sorted_indices = np.argsort(hist)[::-1]
+    if len(sorted_indices) >= 2:
+        # Get the price levels for the top 2 bins
+        level1 = (bins[sorted_indices[0]] + bins[sorted_indices[0] + 1]) / 2
+        level2 = (bins[sorted_indices[1]] + bins[sorted_indices[1] + 1]) / 2
+        
+        # Assign as support/resistance based on current price
+        current_price = df['Close'].iloc[-1]
+        if level1 > current_price and level2 > current_price:
+            resistance = min(level1, level2)
+        elif level1 < current_price and level2 < current_price:
+            support = max(level1, level2)
+        else:
+            support = min(level1, level2)
+            resistance = max(level1, level2)
+    
+    return support, resistance
+
+
+def log_error(error_msg, error_log_file='error_log.txt', console_output=True):
+    """Log errors to file with timestamp and optional console output"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    formatted_msg = f"{timestamp} - {error_msg}"
+    
+    # Log to file
     try:
         with open(error_log_file, 'a') as f:
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {error_msg}\n")
-    except:
-        pass  # Fail silently if we can't write to log
+            f.write(f"{formatted_msg}\n")
+    except Exception as e:
+        if console_output:
+            console.print(f"[red]Failed to write to error log: {e}[/red]")
+    
+    # Log to console if requested
+    if console_output:
+        console.print(f"[red]ERROR:[/red] {error_msg}")
 
 
 def get_stock_data(symbol, retry_count=0, max_retries=3):
     """Fetch stock data with retry logic and comprehensive error handling"""
+    # Calculate retry delay with exponential backoff
+    retry_delay = min(5 * (2 ** retry_count), 30)  # Max 30 seconds
+    
     try:
         stock = yf.Ticker(symbol)
         
@@ -82,10 +236,11 @@ def get_stock_data(symbol, retry_count=0, max_retries=3):
         hist = stock.history(period="1mo")
         if hist.empty or len(hist) < 20:
             if retry_count < max_retries:
-                time.sleep(2)  # Brief pause before retry
+                log_error(f"{symbol}: No data available, retry {retry_count + 1}/{max_retries} in {retry_delay}s", console_output=False)
+                time.sleep(retry_delay)
                 return get_stock_data(symbol, retry_count + 1, max_retries)
-            log_error(f"{symbol}: No data available")
-            return None
+            log_error(f"{symbol}: No data available after {max_retries} retries")
+            return {'symbol': symbol, 'status': 'NO_DATA', 'error': 'No historical data available'}
             
         current_price = hist['Close'].iloc[-1]
         previous_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
@@ -118,6 +273,21 @@ def get_stock_data(symbol, retry_count=0, max_retries=3):
             pct_from_high = 0
             pct_from_low = 0
         
+        # VWAP calculation
+        vwap = calculate_vwap(hist)
+        vwap_distance = ((current_price - vwap) / vwap * 100) if vwap else None
+        
+        # Trend strength
+        trend_slope, trend_strength = calculate_trend_strength(hist['Close'].values)
+        
+        # Bar pattern
+        open_price = hist['Open'].iloc[-1]
+        prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else None
+        bar_pattern = identify_bar_pattern(open_price, day_high, day_low, current_price, prev_close)
+        
+        # Support and Resistance
+        support, resistance = calculate_support_resistance(hist)
+        
         return {
             'symbol': symbol,
             'current_price': current_price,
@@ -132,27 +302,48 @@ def get_stock_data(symbol, retry_count=0, max_retries=3):
             'vol_ratio': vol_ratio,
             'pct_from_high': pct_from_high,
             'pct_from_low': pct_from_low,
+            'vwap': vwap,
+            'vwap_distance': vwap_distance,
+            'trend_slope': trend_slope,
+            'trend_strength': trend_strength,
+            'bar_pattern': bar_pattern,
+            'support': support,
+            'resistance': resistance,
             'timestamp': datetime.now(),
             'status': 'OK'
         }
         
-    except (socket.timeout, urllib.error.URLError, ConnectionError) as e:
+    except (socket.timeout, urllib.error.URLError, ConnectionError, OSError) as e:
         # Network-related errors
-        error_msg = f"{symbol}: Network error - {type(e).__name__}"
+        error_type = type(e).__name__
+        error_msg = f"{symbol}: Network error - {error_type}: {str(e)}"
+        
         if retry_count < max_retries:
-            time.sleep(5)  # Wait 5 seconds before retry
+            log_error(f"{error_msg}, retry {retry_count + 1}/{max_retries} in {retry_delay}s", console_output=False)
+            time.sleep(retry_delay)
             return get_stock_data(symbol, retry_count + 1, max_retries)
-        log_error(error_msg)
-        return {'symbol': symbol, 'status': 'NETWORK_ERROR', 'error': str(e)}
+        
+        log_error(f"{error_msg} after {max_retries} retries")
+        return {'symbol': symbol, 'status': 'NETWORK_ERROR', 'error': error_type, 'message': str(e)}
         
     except Exception as e:
         # Other errors
-        error_msg = f"{symbol}: {type(e).__name__} - {str(e)}"
-        log_error(error_msg)
+        error_type = type(e).__name__
+        error_msg = f"{symbol}: {error_type} - {str(e)}"
+        
+        # Don't retry for certain types of errors
+        non_retryable_errors = ['ValueError', 'KeyError', 'AttributeError']
+        if error_type in non_retryable_errors:
+            log_error(f"{error_msg} (non-retryable)")
+            return {'symbol': symbol, 'status': 'ERROR', 'error': error_type, 'message': str(e)}
+        
         if retry_count < max_retries:
-            time.sleep(2)
+            log_error(f"{error_msg}, retry {retry_count + 1}/{max_retries} in {retry_delay}s", console_output=False)
+            time.sleep(retry_delay)
             return get_stock_data(symbol, retry_count + 1, max_retries)
-        return {'symbol': symbol, 'status': 'ERROR', 'error': str(e)}
+        
+        log_error(f"{error_msg} after {max_retries} retries")
+        return {'symbol': symbol, 'status': 'ERROR', 'error': error_type, 'message': str(e)}
 
 
 def format_number(num):
@@ -166,101 +357,175 @@ def format_number(num):
         return f"{num:.2f}"
 
 
-def create_stock_table(stocks_data):
-    """Create a rich table with stock data"""
-    table = Table(
-        title="Stock Market Monitor",
+def create_stock_tables(stocks_data):
+    """Create two rich tables with stock data"""
+    # First table: Price and Volume
+    price_table = Table(
+        title="📈 Price & Volume",
         box=box.ROUNDED,
         show_header=True,
         header_style="bold cyan",
-        title_style="bold white",
-        caption=f"Last Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        caption_style="dim"
+        title_style="bold white"
     )
     
-    # Add columns
-    table.add_column("Symbol", style="bold white", width=8)
-    table.add_column("Price", justify="right", width=10)
-    table.add_column("Change", justify="right", width=10)
-    table.add_column("%Chg", justify="right", width=8)
-    table.add_column("SMA(20)", justify="right", style="dim", width=10)
-    table.add_column("RSI(14)", justify="right", width=8)
-    table.add_column("Vol/Avg", justify="right", style="dim", width=8)
-    table.add_column("Range", justify="center", style="dim", width=18)
-    table.add_column("%High", justify="right", style="red dim", width=8)
-    table.add_column("%Low", justify="right", style="green dim", width=8)
+    price_table.add_column("Symbol", style="bold white", width=8)
+    price_table.add_column("Price", justify="right", width=10)
+    price_table.add_column("Change", justify="right", width=10)
+    price_table.add_column("%Chg", justify="right", width=8)
+    price_table.add_column("Volume", justify="right", width=10)
+    price_table.add_column("VWAP", justify="right", width=10)
+    price_table.add_column("VWAP Dist", justify="right", width=10)
+    price_table.add_column("Pattern", justify="center", width=15)
     
-    # Add rows
+    # Second table: Technical Indicators
+    tech_table = Table(
+        title="📊 Technical Indicators",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold magenta",
+        title_style="bold white"
+    )
+    
+    tech_table.add_column("Symbol", style="bold white", width=8)
+    tech_table.add_column("RSI(14)", justify="right", width=8)
+    tech_table.add_column("Trend", justify="center", width=10)
+    tech_table.add_column("Strength", justify="right", width=10)
+    tech_table.add_column("Support", justify="right", width=10)
+    tech_table.add_column("Resistance", justify="right", width=10)
+    tech_table.add_column("SMA(20)", justify="right", width=10)
+    tech_table.add_column("Range %", justify="center", width=15)
+    
+    # Add rows to both tables
     for data in stocks_data:
         if not data:
             continue
             
         # Handle error cases
         if 'status' in data and data['status'] != 'OK':
-            table.add_row(
-                data['symbol'],
-                "[red]Error[/red]",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-"
+            error_text = "[red]"
+            if data['status'] == 'NETWORK_ERROR':
+                error_text += "Network Error"
+            elif data['status'] == 'NO_DATA':
+                error_text += "No Data"
+            else:
+                error_text += "Error"
+            error_text += "[/red]"
+            
+            # Add error rows to both tables
+            price_table.add_row(
+                data['symbol'], error_text, "-", "-", "-", "-", "-", "-"
+            )
+            tech_table.add_row(
+                data['symbol'], "-", "-", "-", "-", "-", "-", "-"
             )
             continue
         
-        # Format values
+        # Format values for price table
         is_up = data['change'] >= 0
         change_color = "green" if is_up else "red"
-        arrow = "^" if is_up else "v"
+        arrow = "▲" if is_up else "▼"
         
         price_str = f"${data['current_price']:.2f}"
         change_str = f"[{change_color}]{arrow} ${abs(data['change']):.2f}[/{change_color}]"
         percent_str = f"[{change_color}]{data['change_percent']:+.2f}%[/{change_color}]"
         
-        sma_str = f"${data['sma_20']:.2f}"
+        # Volume formatting
+        volume_str = format_number(data['volume'])
         
+        # VWAP formatting
+        if data.get('vwap'):
+            vwap_str = f"${data['vwap']:.2f}"
+            vwap_dist = data.get('vwap_distance', 0)
+            if vwap_dist > 0:
+                vwap_dist_str = f"[green]+{vwap_dist:.2f}%[/green]"
+            else:
+                vwap_dist_str = f"[red]{vwap_dist:.2f}%[/red]"
+        else:
+            vwap_str = "N/A"
+            vwap_dist_str = "N/A"
+        
+        # Pattern formatting with color
+        pattern = data.get('bar_pattern', 'Normal')
+        if 'Bullish' in pattern or 'Hammer' in pattern:
+            pattern_str = f"[green]{pattern}[/green]"
+        elif 'Bearish' in pattern or 'Shooting' in pattern:
+            pattern_str = f"[red]{pattern}[/red]"
+        elif 'Doji' in pattern:
+            pattern_str = f"[yellow]{pattern}[/yellow]"
+        else:
+            pattern_str = f"[dim]{pattern}[/dim]"
+        
+        # Add row to price table
+        price_table.add_row(
+            data['symbol'],
+            price_str,
+            change_str,
+            percent_str,
+            volume_str,
+            vwap_str,
+            vwap_dist_str,
+            pattern_str
+        )
+        
+        # Format values for technical table
         # RSI with color coding
-        rsi_val = data['rsi']
+        rsi_val = data.get('rsi')
         if rsi_val is not None:
             if rsi_val >= 70:
-                rsi_str = f"[red]{rsi_val:.1f}[/red]"
+                rsi_str = f"[red bold]{rsi_val:.1f}[/red bold]"
             elif rsi_val <= 30:
-                rsi_str = f"[green]{rsi_val:.1f}[/green]"
+                rsi_str = f"[green bold]{rsi_val:.1f}[/green bold]"
             else:
                 rsi_str = f"{rsi_val:.1f}"
         else:
             rsi_str = "N/A"
         
-        # Volume ratio
-        vol_ratio = data['vol_ratio']
-        if vol_ratio >= 1.5:
-            vol_str = f"[yellow]{vol_ratio:.2f}x[/yellow]"
-        elif vol_ratio <= 0.5:
-            vol_str = f"[cyan]{vol_ratio:.2f}x[/cyan]"
+        # Trend formatting
+        trend_slope = data.get('trend_slope', 0)
+        trend_strength = data.get('trend_strength', 0)
+        
+        if trend_slope and trend_slope > 0.5:
+            trend_str = "[green]↗ UP[/green]"
+        elif trend_slope and trend_slope < -0.5:
+            trend_str = "[red]↘ DOWN[/red]"
         else:
-            vol_str = f"{vol_ratio:.2f}x"
+            trend_str = "[yellow]→ FLAT[/yellow]"
         
-        range_str = f"${data['day_low']:.2f}-${data['day_high']:.2f}"
-        pct_high_str = f"{data['pct_from_high']:.2f}%"
-        pct_low_str = f"{data['pct_from_low']:.2f}%"
+        if trend_strength:
+            strength_str = f"{trend_strength:.1f}%"
+            if trend_strength > 70:
+                strength_str = f"[bold]{strength_str}[/bold]"
+        else:
+            strength_str = "N/A"
         
-        table.add_row(
+        # Support/Resistance
+        support = data.get('support')
+        resistance = data.get('resistance')
+        support_str = f"${support:.2f}" if support else "N/A"
+        resistance_str = f"${resistance:.2f}" if resistance else "N/A"
+        
+        # SMA
+        sma_str = f"${data['sma_20']:.2f}"
+        
+        # Range position
+        pct_from_high = data.get('pct_from_high', 0)
+        pct_from_low = data.get('pct_from_low', 0)
+        range_position = (pct_from_low / (pct_from_low + pct_from_high) * 100) if (pct_from_low + pct_from_high) > 0 else 50
+        range_str = f"{range_position:.0f}% [dim]({pct_from_low:.1f}↑/{pct_from_high:.1f}↓)[/dim]"
+        
+        # Add row to technical table
+        tech_table.add_row(
             data['symbol'],
-            price_str,
-            change_str,
-            percent_str,
-            sma_str,
             rsi_str,
-            vol_str,
-            range_str,
-            pct_high_str,
-            pct_low_str
+            trend_str,
+            strength_str,
+            support_str,
+            resistance_str,
+            sma_str,
+            range_str
         )
     
-    return table
+    return price_table, tech_table
 
 
 def create_header():
@@ -281,9 +546,15 @@ def create_header():
     )
 
 
-def create_status_bar(config, alerts_count, last_update, paused):
+def create_status_bar(config, alerts_count, last_update, paused, connection_status=True, error_count=0):
     """Create a status bar with system info"""
     status_items = []
+    
+    # Connection status
+    if connection_status:
+        status_items.append("[green]● Connected[/green]")
+    else:
+        status_items.append("[red]● Disconnected[/red]")
     
     # Paused status
     if paused:
@@ -301,6 +572,10 @@ def create_status_bar(config, alerts_count, last_update, paused):
     # Alerts
     if alerts_count > 0:
         status_items.append(f"[yellow]Alerts: {alerts_count}[/yellow]")
+    
+    # Error count
+    if error_count > 0:
+        status_items.append(f"[red]Errors: {error_count}[/red]")
     
     # Last update
     if last_update:
@@ -365,7 +640,9 @@ def log_to_csv(data, log_dir):
     with open(filename, 'a', newline='') as csvfile:
         fieldnames = ['timestamp', 'symbol', 'price', 'volume', 'change', 'change_percent', 
                      'day_high', 'day_low', 'sma_20', 'rsi_14', 'volume_ratio', 
-                     'pct_from_high', 'pct_from_low']
+                     'pct_from_high', 'pct_from_low', 'vwap', 'vwap_distance',
+                     'trend_slope', 'trend_strength', 'bar_pattern', 
+                     'support', 'resistance']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         # Write header if file is new
@@ -386,7 +663,14 @@ def log_to_csv(data, log_dir):
             'rsi_14': data['rsi'] if data['rsi'] is not None else '',
             'volume_ratio': data['vol_ratio'],
             'pct_from_high': data['pct_from_high'],
-            'pct_from_low': data['pct_from_low']
+            'pct_from_low': data['pct_from_low'],
+            'vwap': data.get('vwap', ''),
+            'vwap_distance': data.get('vwap_distance', ''),
+            'trend_slope': data.get('trend_slope', ''),
+            'trend_strength': data.get('trend_strength', ''),
+            'bar_pattern': data.get('bar_pattern', ''),
+            'support': data.get('support', ''),
+            'resistance': data.get('resistance', '')
         })
 
 
@@ -474,14 +758,29 @@ def log_alert(alert, alert_log_file='alerts_log.txt'):
         f.write(f"(Price: ${alert['price']:.2f})\n")
 
 
-def check_network_connection():
-    """Check if we have internet connectivity"""
-    try:
-        # Try to connect to a reliable host
-        socket.create_connection(("8.8.8.8", 53), timeout=3)
-        return True
-    except (socket.timeout, socket.error):
-        return False
+def check_network_connection(retry_count=0, max_retries=3):
+    """Check if we have internet connectivity with retry logic"""
+    hosts = [
+        ("8.8.8.8", 53),        # Google DNS
+        ("1.1.1.1", 53),        # Cloudflare DNS
+        ("208.67.222.222", 53), # OpenDNS
+    ]
+    
+    for host, port in hosts:
+        try:
+            socket.create_connection((host, port), timeout=3)
+            return True
+        except (socket.timeout, socket.error) as e:
+            if retry_count == 0:
+                log_error(f"Network check failed for {host}: {e}", console_output=False)
+            continue
+    
+    # All hosts failed, retry if we haven't exceeded max retries
+    if retry_count < max_retries:
+        time.sleep(2 * (retry_count + 1))  # Exponential backoff
+        return check_network_connection(retry_count + 1, max_retries)
+    
+    return False
 
 
 def is_market_hours(config):
@@ -591,6 +890,9 @@ def main():
     network_error_count = 0
     last_update = None
     force_refresh = False
+    connection_status = True
+    total_errors = 0
+    consecutive_errors = {}  # Track consecutive errors per symbol
     
     try:
         while running:
@@ -624,27 +926,62 @@ def main():
             # Check network connectivity
             if not check_network_connection():
                 network_error_count += 1
+                connection_status = False
+                console.clear()
+                console.print(create_header())
+                
+                # Calculate retry delay with exponential backoff
+                retry_delay = min(5 * (2 ** (network_error_count - 1)), 60)  # Max 60 seconds
+                
                 error_panel = Panel(
-                    f"[red bold]NETWORK CONNECTION ERROR[/red bold]\n"
-                    f"Attempt #{network_error_count} - Retrying in 10 seconds...",
+                    f"[red bold]NETWORK CONNECTION ERROR[/red bold]\n\n"
+                    f"[yellow]Unable to connect to the internet[/yellow]\n"
+                    f"Attempt #{network_error_count}\n\n"
+                    f"[dim]Tested connections:[/dim]\n"
+                    f"  • Google DNS (8.8.8.8)\n"
+                    f"  • Cloudflare DNS (1.1.1.1)\n"
+                    f"  • OpenDNS (208.67.222.222)\n\n"
+                    f"[cyan]Retrying in {retry_delay} seconds...[/cyan]\n\n"
+                    f"[dim]Check your internet connection and firewall settings[/dim]",
                     box=box.HEAVY,
                     border_style="red",
-                    title="[red]ERROR[/red]"
+                    title="[red]CONNECTION ERROR[/red]",
+                    title_align="center"
                 )
                 console.print(error_panel)
-                log_error(f"Network connection lost - attempt #{network_error_count}")
+                console.print(create_command_bar())
                 
-                # Wait before retry (but check for commands)
-                for i in range(10):
-                    if not command_queue.empty():
-                        break
-                    time.sleep(1)
+                log_error(f"Network connection lost - attempt #{network_error_count}, retry in {retry_delay}s")
+                
+                # Show countdown timer
+                with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    console=console,
+                    transient=True
+                ) as progress:
+                    task = progress.add_task(f"[yellow]Retrying in {retry_delay} seconds...", total=retry_delay)
+                    
+                    for i in range(retry_delay):
+                        if not command_queue.empty():
+                            break
+                        progress.update(task, advance=1, description=f"[yellow]Retrying in {retry_delay - i - 1} seconds...")
+                        time.sleep(1)
+                
                 continue
             else:
                 # Reset error count on successful connection
                 if network_error_count > 0:
+                    console.print(Panel(
+                        "[green bold]CONNECTION RESTORED![/green bold]\n"
+                        f"Successfully reconnected after {network_error_count} attempts",
+                        box=box.ROUNDED,
+                        border_style="green",
+                        title="[green]SUCCESS[/green]"
+                    ))
                     log_error(f"Network connection restored after {network_error_count} attempts")
                     network_error_count = 0
+                    connection_status = True
+                    time.sleep(2)  # Brief pause to show success message
             
             # Check if we're within market hours
             if not is_market_hours(config) and not force_refresh:
@@ -678,6 +1015,7 @@ def main():
             # Fetch and display data for all stocks
             all_alerts = []
             stocks_data = []
+            current_errors = 0
             
             with Progress(
                 SpinnerColumn(),
@@ -692,6 +1030,15 @@ def main():
                     data = get_stock_data(symbol)
                     stocks_data.append(data)
                     
+                    # Track errors
+                    if data and 'status' in data and data['status'] != 'OK':
+                        current_errors += 1
+                        consecutive_errors[symbol] = consecutive_errors.get(symbol, 0) + 1
+                        log_error(f"{symbol}: {consecutive_errors[symbol]} consecutive errors", console_output=False)
+                    elif symbol in consecutive_errors:
+                        # Reset consecutive error count on success
+                        del consecutive_errors[symbol]
+                    
                     # Log data to CSV if enabled
                     if data and logging_enabled:
                         log_to_csv(data, log_dir)
@@ -704,13 +1051,16 @@ def main():
             # Display header
             console.print(create_header())
             
-            # Display table
-            table = create_stock_table(stocks_data)
-            console.print(table)
+            # Display tables
+            price_table, tech_table = create_stock_tables(stocks_data)
+            console.print(price_table)
+            console.print("")  # Space between tables
+            console.print(tech_table)
             
             # Display status bar
             last_update = datetime.now()
-            status_bar = create_status_bar(config, len(triggered_alerts), last_update, paused)
+            total_errors = current_errors
+            status_bar = create_status_bar(config, len(triggered_alerts), last_update, paused, connection_status, total_errors)
             console.print(f"\n[dim]{status_bar}[/dim]")
             
             # Show logging status
@@ -718,6 +1068,13 @@ def main():
                 date_str = datetime.now().strftime('%Y-%m-%d')
                 csv_file = os.path.join(log_dir, f'stock_data_{date_str}.csv')
                 console.print(f"[green][OK] Data logged to:[/green] [yellow]{csv_file}[/yellow]")
+            
+            # Show error summary if there are persistent errors
+            if consecutive_errors:
+                error_symbols = [f"{sym} ({count}x)" for sym, count in consecutive_errors.items() if count >= 3]
+                if error_symbols:
+                    console.print(f"[red]Persistent errors:[/red] {', '.join(error_symbols)}")
+                    console.print(f"[dim]Check error_log.txt for details[/dim]")
             
             # Display command bar
             console.print(create_command_bar())
@@ -743,5 +1100,40 @@ def main():
     sys.exit(0)
 
 
+def run_with_error_recovery():
+    """Run the main function with crash recovery"""
+    restart_count = 0
+    max_restarts = 5
+    
+    while restart_count < max_restarts:
+        try:
+            main()
+            break  # Normal exit
+        except KeyboardInterrupt:
+            console.print("\n\n[yellow]Stock monitor stopped by user.[/yellow]")
+            break
+        except Exception as e:
+            restart_count += 1
+            error_msg = f"CRITICAL ERROR: {type(e).__name__} - {str(e)}\n{traceback.format_exc()}"
+            log_error(error_msg)
+            
+            console.print(Panel(
+                f"[red bold]UNEXPECTED ERROR[/red bold]\n\n"
+                f"[yellow]{type(e).__name__}:[/yellow] {str(e)}\n\n"
+                f"Restart attempt {restart_count}/{max_restarts}\n"
+                f"[dim]Check error_log.txt for details[/dim]",
+                box=box.HEAVY,
+                border_style="red",
+                title="[red]CRASH RECOVERY[/red]"
+            ))
+            
+            if restart_count < max_restarts:
+                console.print(f"\n[cyan]Restarting in 10 seconds...[/cyan]")
+                time.sleep(10)
+            else:
+                console.print(f"\n[red]Max restart attempts reached. Please check error_log.txt[/red]")
+                break
+
+
 if __name__ == "__main__":
-    main()
+    run_with_error_recovery()
