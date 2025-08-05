@@ -9,9 +9,29 @@ import pytz
 import pandas as pd
 import numpy as np
 import winsound  # For beep on Windows
-from colorama import init, Fore, Style, Back
+import socket
+import urllib.error
+import threading
+import queue
+import msvcrt  # Windows keyboard input
+from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.align import Align
+from rich.text import Text
+from rich import box
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.columns import Columns
+from rich.prompt import Prompt
 
-init(autoreset=True)
+console = Console()
+
+# Global variables for thread communication
+command_queue = queue.Queue()
+paused = False
+running = True
 
 
 def clear_screen():
@@ -44,13 +64,27 @@ def calculate_rsi(prices, period=14):
     return rsi
 
 
-def get_stock_data(symbol):
+def log_error(error_msg, error_log_file='error_log.txt'):
+    """Log errors to file with timestamp"""
+    try:
+        with open(error_log_file, 'a') as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {error_msg}\n")
+    except:
+        pass  # Fail silently if we can't write to log
+
+
+def get_stock_data(symbol, retry_count=0, max_retries=3):
+    """Fetch stock data with retry logic and comprehensive error handling"""
     try:
         stock = yf.Ticker(symbol)
         
         # Fetch 30 days of data for technical indicators
         hist = stock.history(period="1mo")
         if hist.empty or len(hist) < 20:
+            if retry_count < max_retries:
+                time.sleep(2)  # Brief pause before retry
+                return get_stock_data(symbol, retry_count + 1, max_retries)
+            log_error(f"{symbol}: No data available")
             return None
             
         current_price = hist['Close'].iloc[-1]
@@ -98,11 +132,27 @@ def get_stock_data(symbol):
             'vol_ratio': vol_ratio,
             'pct_from_high': pct_from_high,
             'pct_from_low': pct_from_low,
-            'timestamp': datetime.now()
+            'timestamp': datetime.now(),
+            'status': 'OK'
         }
         
+    except (socket.timeout, urllib.error.URLError, ConnectionError) as e:
+        # Network-related errors
+        error_msg = f"{symbol}: Network error - {type(e).__name__}"
+        if retry_count < max_retries:
+            time.sleep(5)  # Wait 5 seconds before retry
+            return get_stock_data(symbol, retry_count + 1, max_retries)
+        log_error(error_msg)
+        return {'symbol': symbol, 'status': 'NETWORK_ERROR', 'error': str(e)}
+        
     except Exception as e:
-        return None
+        # Other errors
+        error_msg = f"{symbol}: {type(e).__name__} - {str(e)}"
+        log_error(error_msg)
+        if retry_count < max_retries:
+            time.sleep(2)
+            return get_stock_data(symbol, retry_count + 1, max_retries)
+        return {'symbol': symbol, 'status': 'ERROR', 'error': str(e)}
 
 
 def format_number(num):
@@ -116,87 +166,192 @@ def format_number(num):
         return f"{num:.2f}"
 
 
-def display_header():
-    print(f"\n{Fore.CYAN}{'=' * 150}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}{'STOCK MARKET MONITOR WITH TECHNICAL INDICATORS':^150}")
-    print(f"{Fore.CYAN}{'=' * 150}")
-    print(f"{Fore.WHITE}Last Update: {Fore.YELLOW}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{Fore.CYAN}{'-' * 150}\n")
-
-
-def display_table_header():
-    headers = ['Symbol', 'Price', 'Change', '%Chg', 'SMA(20)', 'RSI(14)', 'Vol/Avg', 'Range', '%High', '%Low']
-    widths = [8, 10, 10, 8, 10, 8, 8, 18, 8, 8]
+def create_stock_table(stocks_data):
+    """Create a rich table with stock data"""
+    table = Table(
+        title="Stock Market Monitor",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+        title_style="bold white",
+        caption=f"Last Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        caption_style="dim"
+    )
     
-    header_line = ""
-    for header, width in zip(headers, widths):
-        header_line += f"{Fore.WHITE}{Style.BRIGHT}{header:^{width}}"
+    # Add columns
+    table.add_column("Symbol", style="bold white", width=8)
+    table.add_column("Price", justify="right", width=10)
+    table.add_column("Change", justify="right", width=10)
+    table.add_column("%Chg", justify="right", width=8)
+    table.add_column("SMA(20)", justify="right", style="dim", width=10)
+    table.add_column("RSI(14)", justify="right", width=8)
+    table.add_column("Vol/Avg", justify="right", style="dim", width=8)
+    table.add_column("Range", justify="center", style="dim", width=18)
+    table.add_column("%High", justify="right", style="red dim", width=8)
+    table.add_column("%Low", justify="right", style="green dim", width=8)
     
-    print(header_line)
-    print(f"{Fore.CYAN}{'-' * 150}")
-
-
-def display_stock_row(data):
-    if not data:
-        return
-    
-    is_up = data['change'] >= 0
-    color = Fore.GREEN if is_up else Fore.RED
-    arrow = "^" if is_up else "v"
-    
-    # Format basic values
-    symbol = f"{Fore.WHITE}{Style.BRIGHT}{data['symbol']:<8}"
-    price = f"{Fore.WHITE}${data['current_price']:>8.2f}"
-    
-    change_sign = "+" if is_up else ""
-    change = f"{color}{arrow} {change_sign}${abs(data['change']):>6.2f}"
-    percent = f"{color}{change_sign}{data['change_percent']:>5.2f}%"
-    
-    # Format SMA
-    sma = f"{Fore.WHITE}${data['sma_20']:>8.2f}"
-    
-    # Format RSI with color coding
-    rsi_val = data['rsi']
-    if rsi_val is not None:
-        if rsi_val >= 70:
-            rsi_color = Fore.RED  # Overbought
-        elif rsi_val <= 30:
-            rsi_color = Fore.GREEN  # Oversold
+    # Add rows
+    for data in stocks_data:
+        if not data:
+            continue
+            
+        # Handle error cases
+        if 'status' in data and data['status'] != 'OK':
+            table.add_row(
+                data['symbol'],
+                "[red]Error[/red]",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-"
+            )
+            continue
+        
+        # Format values
+        is_up = data['change'] >= 0
+        change_color = "green" if is_up else "red"
+        arrow = "^" if is_up else "v"
+        
+        price_str = f"${data['current_price']:.2f}"
+        change_str = f"[{change_color}]{arrow} ${abs(data['change']):.2f}[/{change_color}]"
+        percent_str = f"[{change_color}]{data['change_percent']:+.2f}%[/{change_color}]"
+        
+        sma_str = f"${data['sma_20']:.2f}"
+        
+        # RSI with color coding
+        rsi_val = data['rsi']
+        if rsi_val is not None:
+            if rsi_val >= 70:
+                rsi_str = f"[red]{rsi_val:.1f}[/red]"
+            elif rsi_val <= 30:
+                rsi_str = f"[green]{rsi_val:.1f}[/green]"
+            else:
+                rsi_str = f"{rsi_val:.1f}"
         else:
-            rsi_color = Fore.WHITE
-        rsi = f"{rsi_color}{rsi_val:>6.1f}"
-    else:
-        rsi = f"{Fore.WHITE}{'N/A':>6}"
+            rsi_str = "N/A"
+        
+        # Volume ratio
+        vol_ratio = data['vol_ratio']
+        if vol_ratio >= 1.5:
+            vol_str = f"[yellow]{vol_ratio:.2f}x[/yellow]"
+        elif vol_ratio <= 0.5:
+            vol_str = f"[cyan]{vol_ratio:.2f}x[/cyan]"
+        else:
+            vol_str = f"{vol_ratio:.2f}x"
+        
+        range_str = f"${data['day_low']:.2f}-${data['day_high']:.2f}"
+        pct_high_str = f"{data['pct_from_high']:.2f}%"
+        pct_low_str = f"{data['pct_from_low']:.2f}%"
+        
+        table.add_row(
+            data['symbol'],
+            price_str,
+            change_str,
+            percent_str,
+            sma_str,
+            rsi_str,
+            vol_str,
+            range_str,
+            pct_high_str,
+            pct_low_str
+        )
     
-    # Volume ratio
-    vol_ratio = data['vol_ratio']
-    if vol_ratio >= 1.5:
-        vol_color = Fore.YELLOW  # High volume
-    elif vol_ratio <= 0.5:
-        vol_color = Fore.CYAN  # Low volume
-    else:
-        vol_color = Fore.WHITE
-    vol_str = f"{vol_color}{vol_ratio:>6.2f}x"
-    
-    # Day range
-    day_range = f"{Fore.WHITE}${data['day_low']:.2f}-${data['day_high']:.2f}"
-    
-    # Distance from high/low
-    pct_high = f"{Fore.RED}{data['pct_from_high']:>6.2f}%"
-    pct_low = f"{Fore.GREEN}{data['pct_from_low']:>6.2f}%"
-    
-    # Headers: ['Symbol', 'Price', 'Change', '%Chg', 'SMA(20)', 'RSI(14)', 'Vol/Avg', 'Range', '%High', '%Low']
-    # Widths:  [8, 10, 10, 8, 10, 8, 8, 18, 8, 8]
-    
-    print(f"{symbol} {price} {change} {percent} {sma} {rsi} {vol_str} {day_range:<18} {pct_high} {pct_low}")
+    return table
 
 
-def display_footer():
-    print(f"\n{Fore.CYAN}{'=' * 150}\n")
+def create_header():
+    """Create a header panel with current time"""
+    now = datetime.now()
+    time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    
+    header_text = Text()
+    header_text.append("STOCK MARKET MONITOR ", style="bold cyan")
+    header_text.append("WITH TECHNICAL INDICATORS ", style="bold yellow")
+    header_text.append(f"| {time_str}", style="dim white")
+    
+    return Panel(
+        Align.center(header_text),
+        box=box.DOUBLE,
+        border_style="cyan",
+        padding=(0, 1)
+    )
+
+
+def create_status_bar(config, alerts_count, last_update, paused):
+    """Create a status bar with system info"""
+    status_items = []
+    
+    # Paused status
+    if paused:
+        status_items.append("[yellow bold]PAUSED[/yellow bold]")
+    
+    # Market status
+    if is_market_hours(config):
+        status_items.append("[green]* Market Open[/green]")
+    else:
+        status_items.append("[red]* Market Closed[/red]")
+    
+    # Update interval
+    status_items.append(f"Update: {config.get('update_interval', 5)}s")
+    
+    # Alerts
+    if alerts_count > 0:
+        status_items.append(f"[yellow]Alerts: {alerts_count}[/yellow]")
+    
+    # Last update
+    if last_update:
+        status_items.append(f"Last: {last_update.strftime('%H:%M:%S')}")
+    
+    return " | ".join(status_items)
+
+
+def create_command_bar():
+    """Create command bar showing available commands"""
+    commands = [
+        "[bold cyan]Q[/bold cyan] Quit",
+        "[bold cyan]A[/bold cyan] Add Stock",
+        "[bold cyan]R[/bold cyan] Remove Stock",
+        "[bold cyan]P[/bold cyan] Pause/Resume",
+    ]
+    
+    return Panel(
+        " | ".join(commands),
+        box=box.MINIMAL,
+        border_style="dim",
+        padding=(0, 1)
+    )
+
+
+def display_alert_rich(alert):
+    """Display alert using rich formatting"""
+    alert_color = "red" if alert['type'] == 'ABOVE' else "yellow"
+    
+    alert_panel = Panel(
+        f"[{alert_color} bold]PRICE ALERT: {alert['symbol']}[/{alert_color} bold]\n"
+        f"[{alert_color}]{alert['type']} ${alert['threshold']:.2f}[/{alert_color}]\n"
+        f"Current Price: ${alert['price']:.2f}",
+        box=box.HEAVY,
+        border_style=alert_color,
+        title="[bold]ALERT[/bold]",
+        title_align="center"
+    )
+    
+    console.print(alert_panel)
+    
+    # Beep sound (Windows)
+    try:
+        if sys.platform == 'win32':
+            winsound.Beep(1000, 300)  # 1000 Hz for 300 ms
+    except:
+        pass
 
 
 def log_to_csv(data, log_dir):
-    if not data:
+    if not data or 'status' in data and data['status'] != 'OK':
         return
     
     # Create filename based on current date
@@ -240,7 +395,7 @@ def load_config():
         with open('config.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"{Fore.RED}Error: config.json not found. Using default configuration.")
+        console.print("[red]Error: config.json not found. Using default configuration.[/red]")
         return {
             "stocks": ["AAPL", "GOOGL", "MSFT"],
             "update_interval": 5,
@@ -254,6 +409,15 @@ def load_config():
         }
 
 
+def save_config(config):
+    """Save configuration back to file"""
+    try:
+        with open('config.json', 'w') as f:
+            json.dump(config, f, indent=4)
+    except Exception as e:
+        log_error(f"Failed to save config: {e}")
+
+
 def load_alerts():
     try:
         with open('alerts.json', 'r') as f:
@@ -261,7 +425,7 @@ def load_alerts():
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError:
-        print(f"{Fore.YELLOW}Warning: alerts.json is invalid. No alerts loaded.")
+        console.print("[yellow]Warning: alerts.json is invalid. No alerts loaded.[/yellow]")
         return {}
 
 
@@ -303,26 +467,21 @@ def check_alerts(data, alerts, triggered_alerts):
     return new_alerts
 
 
-def display_alert(alert):
-    alert_color = Fore.RED if alert['type'] == 'ABOVE' else Fore.YELLOW
-    print(f"\n{alert_color}{Style.BRIGHT}" + "=" * 60)
-    print(f"{alert_color}{Style.BRIGHT}🚨 PRICE ALERT: {alert['symbol']} - {alert['type']} ${alert['threshold']:.2f}")
-    print(f"{alert_color}{Style.BRIGHT}Current Price: ${alert['price']:.2f}")
-    print(f"{alert_color}{Style.BRIGHT}" + "=" * 60 + f"{Style.RESET_ALL}\n")
-    
-    # Beep sound (Windows)
-    try:
-        if sys.platform == 'win32':
-            winsound.Beep(1000, 300)  # 1000 Hz for 300 ms
-    except:
-        pass
-
-
 def log_alert(alert, alert_log_file='alerts_log.txt'):
     with open(alert_log_file, 'a') as f:
         f.write(f"{alert['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} - ")
         f.write(f"{alert['symbol']} {alert['type']} ${alert['threshold']:.2f} ")
         f.write(f"(Price: ${alert['price']:.2f})\n")
+
+
+def check_network_connection():
+    """Check if we have internet connectivity"""
+    try:
+        # Try to connect to a reliable host
+        socket.create_connection(("8.8.8.8", 53), timeout=3)
+        return True
+    except (socket.timeout, socket.error):
+        return False
 
 
 def is_market_hours(config):
@@ -345,7 +504,66 @@ def is_market_hours(config):
     return open_time <= current_time <= close_time
 
 
+def keyboard_listener():
+    """Thread function to listen for keyboard input"""
+    global running, paused
+    
+    while running:
+        if msvcrt.kbhit():
+            key = msvcrt.getch().decode('utf-8').lower()
+            command_queue.put(key)
+        time.sleep(0.1)
+
+
+def handle_add_stock(config):
+    """Handle adding a new stock"""
+    console.print("\n[cyan]Enter stock symbol to add (or press Enter to cancel):[/cyan]")
+    symbol = input("> ").upper().strip()
+    
+    if symbol and symbol not in config['stocks']:
+        config['stocks'].append(symbol)
+        save_config(config)
+        console.print(f"[green]Added {symbol} to watchlist[/green]")
+        return True
+    elif symbol in config['stocks']:
+        console.print(f"[yellow]{symbol} is already in watchlist[/yellow]")
+    
+    return False
+
+
+def handle_remove_stock(config):
+    """Handle removing a stock"""
+    if not config['stocks']:
+        console.print("[yellow]No stocks to remove[/yellow]")
+        return False
+    
+    console.print("\n[cyan]Current stocks:[/cyan]")
+    for i, stock in enumerate(config['stocks']):
+        console.print(f"{i+1}. {stock}")
+    
+    console.print("\n[cyan]Enter number to remove (or press Enter to cancel):[/cyan]")
+    try:
+        choice = input("> ").strip()
+        if choice:
+            idx = int(choice) - 1
+            if 0 <= idx < len(config['stocks']):
+                removed = config['stocks'].pop(idx)
+                save_config(config)
+                console.print(f"[green]Removed {removed} from watchlist[/green]")
+                return True
+    except (ValueError, IndexError):
+        console.print("[red]Invalid selection[/red]")
+    
+    return False
+
+
 def main():
+    global running, paused
+    
+    # Start keyboard listener thread
+    keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    keyboard_thread.start()
+    
     # Load configuration
     config = load_config()
     alerts = load_alerts()
@@ -360,79 +578,169 @@ def main():
     if logging_enabled and log_dir:
         os.makedirs(log_dir, exist_ok=True)
     
-    print(f"{Fore.CYAN}{Style.BRIGHT}Starting Stock Market Monitor")
-    print(f"{Fore.WHITE}Monitoring: {Fore.YELLOW}{', '.join(symbols)}")
-    print(f"{Fore.WHITE}Update Interval: {Fore.YELLOW}{update_interval} seconds")
-    print(f"{Fore.WHITE}Logging: {Fore.YELLOW}{'Enabled' if logging_enabled else 'Disabled'}")
-    print(f"{Fore.WHITE}Market Hours: {Fore.YELLOW}{config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET")
-    print(f"{Fore.WHITE}Alerts: {Fore.YELLOW}{len(alerts)} stocks configured")
-    print(f"{Fore.WHITE}Press {Fore.RED}Ctrl+C{Fore.WHITE} to stop\n")
+    console.print(create_header())
+    console.print(f"[cyan]Monitoring:[/cyan] {', '.join(symbols)}")
+    console.print(f"[cyan]Update Interval:[/cyan] {update_interval} seconds")
+    console.print(f"[cyan]Logging:[/cyan] {'Enabled' if logging_enabled else 'Disabled'}")
+    console.print(f"[cyan]Market Hours:[/cyan] {config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET")
+    console.print(f"[cyan]Alerts:[/cyan] {len(alerts)} stocks configured")
+    console.print(create_command_bar())
     
     time.sleep(2)
     
+    network_error_count = 0
+    last_update = None
+    force_refresh = False
+    
     try:
-        while True:
-            # Check if we're within market hours
-            if not is_market_hours(config):
-                clear_screen()
-                display_header()
+        while running:
+            # Check for keyboard commands
+            while not command_queue.empty():
+                cmd = command_queue.get()
                 
-                # Get timezone for display
+                if cmd == 'q':
+                    running = False
+                    break
+                elif cmd == 'p':
+                    paused = not paused
+                    console.print(f"\n[yellow]Updates {'PAUSED' if paused else 'RESUMED'}[/yellow]")
+                elif cmd == 'a':
+                    if handle_add_stock(config):
+                        symbols = config['stocks']
+                        force_refresh = True
+                elif cmd == 'r':
+                    if handle_remove_stock(config):
+                        symbols = config['stocks']
+                        force_refresh = True
+            
+            if not running:
+                break
+            
+            # Skip update if paused (unless force refresh)
+            if paused and not force_refresh:
+                time.sleep(0.5)
+                continue
+            
+            # Check network connectivity
+            if not check_network_connection():
+                network_error_count += 1
+                error_panel = Panel(
+                    f"[red bold]NETWORK CONNECTION ERROR[/red bold]\n"
+                    f"Attempt #{network_error_count} - Retrying in 10 seconds...",
+                    box=box.HEAVY,
+                    border_style="red",
+                    title="[red]ERROR[/red]"
+                )
+                console.print(error_panel)
+                log_error(f"Network connection lost - attempt #{network_error_count}")
+                
+                # Wait before retry (but check for commands)
+                for i in range(10):
+                    if not command_queue.empty():
+                        break
+                    time.sleep(1)
+                continue
+            else:
+                # Reset error count on successful connection
+                if network_error_count > 0:
+                    log_error(f"Network connection restored after {network_error_count} attempts")
+                    network_error_count = 0
+            
+            # Check if we're within market hours
+            if not is_market_hours(config) and not force_refresh:
                 tz = pytz.timezone(config['market_hours']['timezone'])
                 now = datetime.now(tz)
                 
-                print(f"{Fore.YELLOW}{Style.BRIGHT}Market is CLOSED")
-                print(f"{Fore.WHITE}Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                print(f"{Fore.WHITE}Market hours: {config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET (Mon-Fri)")
-                print(f"\n{Fore.WHITE}Waiting for market to open...")
+                console.clear()
+                console.print(create_header())
                 
-                # Wait 60 seconds before checking again
-                for i in range(60, 0, -1):
-                    print(f"\r{Fore.WHITE}Checking again in {i} seconds...  ", end="", flush=True)
+                market_panel = Panel(
+                    f"[yellow bold]Market is CLOSED[/yellow bold]\n"
+                    f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                    f"Market hours: {config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET (Mon-Fri)\n"
+                    f"\n[dim]Waiting for market to open...[/dim]",
+                    box=box.ROUNDED,
+                    border_style="yellow"
+                )
+                console.print(market_panel)
+                console.print(create_command_bar())
+                
+                # Wait but check for commands
+                for i in range(60):
+                    if not command_queue.empty():
+                        break
                     time.sleep(1)
                 continue
             
-            clear_screen()
-            display_header()
-            display_table_header()
+            # Clear screen and fetch data
+            console.clear()
             
             # Fetch and display data for all stocks
             all_alerts = []
-            for symbol in symbols:
-                data = get_stock_data(symbol)
-                display_stock_row(data)
-                # Log data to CSV if enabled
-                if data and logging_enabled:
-                    log_to_csv(data, log_dir)
-                # Check for alerts
-                new_alerts = check_alerts(data, alerts, triggered_alerts)
-                all_alerts.extend(new_alerts)
+            stocks_data = []
             
-            display_footer()
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True
+            ) as progress:
+                task = progress.add_task("[cyan]Fetching stock data...", total=len(symbols))
+                
+                for symbol in symbols:
+                    progress.update(task, advance=1, description=f"[cyan]Fetching {symbol}...")
+                    data = get_stock_data(symbol)
+                    stocks_data.append(data)
+                    
+                    # Log data to CSV if enabled
+                    if data and logging_enabled:
+                        log_to_csv(data, log_dir)
+                    
+                    # Check for alerts only for successful data fetches
+                    if data and data.get('status') == 'OK':
+                        new_alerts = check_alerts(data, alerts, triggered_alerts)
+                        all_alerts.extend(new_alerts)
             
-            # Display and log any triggered alerts
-            for alert in all_alerts:
-                display_alert(alert)
-                log_alert(alert)
+            # Display header
+            console.print(create_header())
+            
+            # Display table
+            table = create_stock_table(stocks_data)
+            console.print(table)
+            
+            # Display status bar
+            last_update = datetime.now()
+            status_bar = create_status_bar(config, len(triggered_alerts), last_update, paused)
+            console.print(f"\n[dim]{status_bar}[/dim]")
             
             # Show logging status
             if logging_enabled:
                 date_str = datetime.now().strftime('%Y-%m-%d')
                 csv_file = os.path.join(log_dir, f'stock_data_{date_str}.csv')
-                print(f"{Fore.GREEN}[OK] Data logged to: {Fore.YELLOW}{csv_file}")
-            else:
-                print(f"{Fore.YELLOW}[INFO] Data logging is disabled")
+                console.print(f"[green][OK] Data logged to:[/green] [yellow]{csv_file}[/yellow]")
             
-            print(f"{Fore.WHITE}Next update in {update_interval} seconds...")
+            # Display command bar
+            console.print(create_command_bar())
             
-            # Countdown timer
-            for i in range(update_interval, 0, -1):
-                print(f"\r{Fore.WHITE}Next update in {i} seconds...  ", end="", flush=True)
-                time.sleep(1)
+            # Display and log any triggered alerts
+            for alert in all_alerts:
+                display_alert_rich(alert)
+                log_alert(alert)
+            
+            force_refresh = False
+            
+            # Countdown timer (with command checking)
+            if not paused:
+                for i in range(update_interval):
+                    if not command_queue.empty():
+                        break
+                    time.sleep(1)
                 
     except KeyboardInterrupt:
-        print(f"\n\n{Fore.YELLOW}Stock monitor stopped.")
-        sys.exit(0)
+        running = False
+    
+    console.print("\n\n[yellow]Stock monitor stopped.[/yellow]")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
