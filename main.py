@@ -2,7 +2,10 @@ import yfinance as yf
 import time
 import os
 import sys
+import csv
+import json
 from datetime import datetime
+import pytz
 from colorama import init, Fore, Style, Back
 
 init(autoreset=True)
@@ -114,19 +117,121 @@ def display_footer():
     print(f"\n{Fore.CYAN}{'=' * 90}\n")
 
 
+def log_to_csv(data, log_dir):
+    if not data:
+        return
+    
+    # Create filename based on current date
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    filename = os.path.join(log_dir, f'stock_data_{date_str}.csv')
+    
+    # Check if file exists to determine if we need to write headers
+    file_exists = os.path.exists(filename)
+    
+    # Write data to CSV
+    with open(filename, 'a', newline='') as csvfile:
+        fieldnames = ['timestamp', 'symbol', 'price', 'volume', 'change', 'change_percent', 'day_high', 'day_low']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        # Write header if file is new
+        if not file_exists:
+            writer.writeheader()
+        
+        # Write the data row
+        writer.writerow({
+            'timestamp': data['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+            'symbol': data['symbol'],
+            'price': data['current_price'],
+            'volume': data['volume'],
+            'change': data['change'],
+            'change_percent': data['change_percent'],
+            'day_high': data['day_high'],
+            'day_low': data['day_low']
+        })
+
+
+def load_config():
+    try:
+        with open('config.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"{Fore.RED}Error: config.json not found. Using default configuration.")
+        return {
+            "stocks": ["AAPL", "GOOGL", "MSFT"],
+            "update_interval": 5,
+            "logging": {"enabled": True, "directory": "data"},
+            "market_hours": {
+                "timezone": "America/New_York",
+                "open_time": "09:30",
+                "close_time": "16:00",
+                "monitor_outside_hours": False
+            }
+        }
+
+
+def is_market_hours(config):
+    market_config = config.get('market_hours', {})
+    if market_config.get('monitor_outside_hours', False):
+        return True
+    
+    tz = pytz.timezone(market_config.get('timezone', 'America/New_York'))
+    now = datetime.now(tz)
+    
+    # Check if it's a weekday (Monday = 0, Sunday = 6)
+    if now.weekday() > 4:  # Saturday or Sunday
+        return False
+    
+    # Parse market hours
+    open_time = datetime.strptime(market_config.get('open_time', '09:30'), '%H:%M').time()
+    close_time = datetime.strptime(market_config.get('close_time', '16:00'), '%H:%M').time()
+    
+    current_time = now.time()
+    return open_time <= current_time <= close_time
+
+
 def main():
-    symbols = ["AAPL", "TSLA", "NVDA", "SPY"]
-    update_interval = 30
+    # Load configuration
+    config = load_config()
+    symbols = config.get('stocks', ["AAPL", "GOOGL", "MSFT"])
+    update_interval = config.get('update_interval', 5)
+    logging_enabled = config.get('logging', {}).get('enabled', True)
+    log_dir = config.get('logging', {}).get('directory', 'data')
+    
+    # Create log directory if it doesn't exist
+    if logging_enabled and log_dir:
+        os.makedirs(log_dir, exist_ok=True)
     
     print(f"{Fore.CYAN}{Style.BRIGHT}Starting Stock Market Monitor")
     print(f"{Fore.WHITE}Monitoring: {Fore.YELLOW}{', '.join(symbols)}")
     print(f"{Fore.WHITE}Update Interval: {Fore.YELLOW}{update_interval} seconds")
+    print(f"{Fore.WHITE}Logging: {Fore.YELLOW}{'Enabled' if logging_enabled else 'Disabled'}")
+    print(f"{Fore.WHITE}Market Hours: {Fore.YELLOW}{config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET")
     print(f"{Fore.WHITE}Press {Fore.RED}Ctrl+C{Fore.WHITE} to stop\n")
     
     time.sleep(2)
     
     try:
         while True:
+            # Check if we're within market hours
+            if not is_market_hours(config):
+                clear_screen()
+                display_header()
+                
+                # Get timezone for display
+                tz = pytz.timezone(config['market_hours']['timezone'])
+                now = datetime.now(tz)
+                
+                print(f"{Fore.YELLOW}{Style.BRIGHT}Market is CLOSED")
+                print(f"{Fore.WHITE}Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                print(f"{Fore.WHITE}Market hours: {config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET (Mon-Fri)")
+                print(f"\n{Fore.WHITE}Waiting for market to open...")
+                
+                # Wait 60 seconds before checking again
+                for i in range(60, 0, -1):
+                    print(f"\r{Fore.WHITE}Checking again in {i} seconds...  ", end="", flush=True)
+                    time.sleep(1)
+                continue
+            
             clear_screen()
             display_header()
             display_table_header()
@@ -135,8 +240,19 @@ def main():
             for symbol in symbols:
                 data = get_stock_data(symbol)
                 display_stock_row(data)
+                # Log data to CSV if enabled
+                if data and logging_enabled:
+                    log_to_csv(data, log_dir)
             
             display_footer()
+            
+            # Show logging status
+            if logging_enabled:
+                date_str = datetime.now().strftime('%Y-%m-%d')
+                csv_file = os.path.join(log_dir, f'stock_data_{date_str}.csv')
+                print(f"{Fore.GREEN}[OK] Data logged to: {Fore.YELLOW}{csv_file}")
+            else:
+                print(f"{Fore.YELLOW}[INFO] Data logging is disabled")
             
             print(f"{Fore.WHITE}Next update in {update_interval} seconds...")
             

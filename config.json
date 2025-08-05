@@ -1,0 +1,19 @@
+{
+    "stocks": [
+        "AAPL",
+        "GOOGL",
+        "MSFT",
+        "AMZN"
+    ],
+    "update_interval": 5,
+    "logging": {
+        "enabled": true,
+        "directory": "data"
+    },
+    "market_hours": {
+        "timezone": "America/New_York",
+        "open_time": "09:30",
+        "close_time": "16:00",
+        "monitor_outside_hours": false
+    }
+}
