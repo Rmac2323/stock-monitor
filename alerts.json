@@ -1,0 +1,22 @@
+{
+    "AAPL": {
+        "above": 205,
+        "below": 203
+    },
+    "TSLA": {
+        "above": 310,
+        "below": 305
+    },
+    "NVDA": {
+        "above": 180,
+        "below": 177
+    },
+    "SPY": {
+        "above": 630,
+        "below": 625
+    },
+    "SMXT": {
+        "above": 2.0,
+        "below": 1.5
+    }
+}

@@ -8,6 +8,7 @@ from datetime import datetime
 import pytz
 import pandas as pd
 import numpy as np
+import winsound  # For beep on Windows
 from colorama import init, Fore, Style, Back
 
 init(autoreset=True)
@@ -253,6 +254,77 @@ def load_config():
         }
 
 
+def load_alerts():
+    try:
+        with open('alerts.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        print(f"{Fore.YELLOW}Warning: alerts.json is invalid. No alerts loaded.")
+        return {}
+
+
+def check_alerts(data, alerts, triggered_alerts):
+    if not data or data['symbol'] not in alerts:
+        return []
+    
+    symbol = data['symbol']
+    price = data['current_price']
+    alert_config = alerts[symbol]
+    new_alerts = []
+    
+    # Check above threshold
+    if 'above' in alert_config and price >= alert_config['above']:
+        alert_key = f"{symbol}_above_{alert_config['above']}"
+        if alert_key not in triggered_alerts:
+            new_alerts.append({
+                'symbol': symbol,
+                'type': 'ABOVE',
+                'threshold': alert_config['above'],
+                'price': price,
+                'timestamp': datetime.now()
+            })
+            triggered_alerts.add(alert_key)
+    
+    # Check below threshold
+    if 'below' in alert_config and price <= alert_config['below']:
+        alert_key = f"{symbol}_below_{alert_config['below']}"
+        if alert_key not in triggered_alerts:
+            new_alerts.append({
+                'symbol': symbol,
+                'type': 'BELOW',
+                'threshold': alert_config['below'],
+                'price': price,
+                'timestamp': datetime.now()
+            })
+            triggered_alerts.add(alert_key)
+    
+    return new_alerts
+
+
+def display_alert(alert):
+    alert_color = Fore.RED if alert['type'] == 'ABOVE' else Fore.YELLOW
+    print(f"\n{alert_color}{Style.BRIGHT}" + "=" * 60)
+    print(f"{alert_color}{Style.BRIGHT}🚨 PRICE ALERT: {alert['symbol']} - {alert['type']} ${alert['threshold']:.2f}")
+    print(f"{alert_color}{Style.BRIGHT}Current Price: ${alert['price']:.2f}")
+    print(f"{alert_color}{Style.BRIGHT}" + "=" * 60 + f"{Style.RESET_ALL}\n")
+    
+    # Beep sound (Windows)
+    try:
+        if sys.platform == 'win32':
+            winsound.Beep(1000, 300)  # 1000 Hz for 300 ms
+    except:
+        pass
+
+
+def log_alert(alert, alert_log_file='alerts_log.txt'):
+    with open(alert_log_file, 'a') as f:
+        f.write(f"{alert['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} - ")
+        f.write(f"{alert['symbol']} {alert['type']} ${alert['threshold']:.2f} ")
+        f.write(f"(Price: ${alert['price']:.2f})\n")
+
+
 def is_market_hours(config):
     market_config = config.get('market_hours', {})
     if market_config.get('monitor_outside_hours', False):
@@ -276,6 +348,9 @@ def is_market_hours(config):
 def main():
     # Load configuration
     config = load_config()
+    alerts = load_alerts()
+    triggered_alerts = set()  # Track already triggered alerts
+    
     symbols = config.get('stocks', ["AAPL", "GOOGL", "MSFT"])
     update_interval = config.get('update_interval', 5)
     logging_enabled = config.get('logging', {}).get('enabled', True)
@@ -290,6 +365,7 @@ def main():
     print(f"{Fore.WHITE}Update Interval: {Fore.YELLOW}{update_interval} seconds")
     print(f"{Fore.WHITE}Logging: {Fore.YELLOW}{'Enabled' if logging_enabled else 'Disabled'}")
     print(f"{Fore.WHITE}Market Hours: {Fore.YELLOW}{config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET")
+    print(f"{Fore.WHITE}Alerts: {Fore.YELLOW}{len(alerts)} stocks configured")
     print(f"{Fore.WHITE}Press {Fore.RED}Ctrl+C{Fore.WHITE} to stop\n")
     
     time.sleep(2)
@@ -321,14 +397,23 @@ def main():
             display_table_header()
             
             # Fetch and display data for all stocks
+            all_alerts = []
             for symbol in symbols:
                 data = get_stock_data(symbol)
                 display_stock_row(data)
                 # Log data to CSV if enabled
                 if data and logging_enabled:
                     log_to_csv(data, log_dir)
+                # Check for alerts
+                new_alerts = check_alerts(data, alerts, triggered_alerts)
+                all_alerts.extend(new_alerts)
             
             display_footer()
+            
+            # Display and log any triggered alerts
+            for alert in all_alerts:
+                display_alert(alert)
+                log_alert(alert)
             
             # Show logging status
             if logging_enabled:
