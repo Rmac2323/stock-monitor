@@ -66,16 +66,27 @@ def calculate_rsi(prices, period=14):
 
 
 def calculate_vwap(df):
-    """Calculate Volume Weighted Average Price for the day"""
+    """Calculate Volume Weighted Average Price
+    
+    For intraday data: Calculate VWAP for the current trading day
+    For daily data: Use the day's VWAP (approximated from OHLC)
+    """
     if df.empty or len(df) == 0:
         return None
     
-    # Get today's data only
-    today = df.index[-1].date()
-    today_data = df[df.index.date == today]
+    # Check if this is intraday data (index has time component)
+    is_intraday = hasattr(df.index[0], 'hour')
     
-    if today_data.empty:
-        return None
+    if is_intraday:
+        # Get today's data only
+        today = df.index[-1].date()
+        today_data = df[df.index.date == today]
+        
+        if today_data.empty:
+            return None
+    else:
+        # For daily data, just use the last day
+        today_data = df.tail(1)
     
     # Calculate typical price (high + low + close) / 3
     typical_price = (today_data['High'] + today_data['Low'] + today_data['Close']) / 3
@@ -224,44 +235,139 @@ def log_error(error_msg, error_log_file='error_log.txt', console_output=True):
         console.print(f"[red]ERROR:[/red] {error_msg}")
 
 
-def get_stock_data(symbol, retry_count=0, max_retries=3):
-    """Fetch stock data with retry logic and comprehensive error handling"""
-    # Calculate retry delay with exponential backoff
-    retry_delay = min(5 * (2 ** retry_count), 30)  # Max 30 seconds
+def fetch_timeframe_data(symbol, interval, period=None):
+    """Fetch data for a specific timeframe"""
+    # Adjust period based on interval if not specified
+    if period is None:
+        if interval in ["1m", "5m", "15m", "30m", "60m", "90m"]:
+            if interval == "1m":
+                period = "5d"
+            else:
+                period = "1mo"
+        else:
+            period = "3mo"
     
     try:
         stock = yf.Ticker(symbol)
+        hist = stock.history(period=period, interval=interval)
+        return hist
+    except Exception as e:
+        log_error(f"Failed to fetch {interval} data for {symbol}: {e}", console_output=False)
+        return None
+
+
+def get_stock_data(symbol, retry_count=0, max_retries=3, timeframes=None):
+    """Fetch stock data with retry logic and comprehensive error handling
+    
+    Args:
+        symbol: Stock symbol to fetch
+        retry_count: Current retry attempt
+        max_retries: Maximum number of retries
+        timeframes: Dict of timeframe configurations for each indicator
+    """
+    # Calculate retry delay with exponential backoff
+    retry_delay = min(5 * (2 ** retry_count), 30)  # Max 30 seconds
+    
+    # Default timeframes if not provided
+    if timeframes is None:
+        timeframes = {
+            "price": "1d",
+            "rsi": {"interval": "1d", "period": 14},
+            "sma": {"interval": "1d", "period": 20},
+            "vwap": "1d",
+            "support_resistance": {"interval": "1d", "lookback": 20},
+            "trend": {"interval": "1d", "period": 20},
+            "patterns": "1d"
+        }
+    
+    try:
+        # Collect all unique intervals we need to fetch
+        intervals_to_fetch = set()
         
-        # Fetch 30 days of data for technical indicators
-        hist = stock.history(period="1mo")
-        if hist.empty or len(hist) < 20:
+        # Price data interval
+        price_interval = timeframes.get("price", "1d")
+        intervals_to_fetch.add(price_interval)
+        
+        # Add other intervals
+        for key in ["rsi", "sma", "support_resistance", "trend"]:
+            if key in timeframes:
+                if isinstance(timeframes[key], dict):
+                    intervals_to_fetch.add(timeframes[key].get("interval", "1d"))
+                else:
+                    intervals_to_fetch.add(timeframes[key])
+        
+        if "vwap" in timeframes:
+            intervals_to_fetch.add(timeframes.get("vwap", price_interval))
+        
+        if "patterns" in timeframes:
+            intervals_to_fetch.add(timeframes.get("patterns", price_interval))
+        
+        # Fetch data for all required intervals
+        data_by_interval = {}
+        stock = yf.Ticker(symbol)
+        
+        for interval in intervals_to_fetch:
+            hist = fetch_timeframe_data(symbol, interval)
+            if hist is not None and not hist.empty:
+                data_by_interval[interval] = hist
+        
+        # Check if we have the primary price data
+        if price_interval not in data_by_interval or len(data_by_interval[price_interval]) < 1:
             if retry_count < max_retries:
-                log_error(f"{symbol}: No data available, retry {retry_count + 1}/{max_retries} in {retry_delay}s", console_output=False)
+                log_error(f"{symbol}: No price data available, retry {retry_count + 1}/{max_retries} in {retry_delay}s", console_output=False)
                 time.sleep(retry_delay)
-                return get_stock_data(symbol, retry_count + 1, max_retries)
+                return get_stock_data(symbol, retry_count + 1, max_retries, timeframes)
             log_error(f"{symbol}: No data available after {max_retries} retries")
             return {'symbol': symbol, 'status': 'NO_DATA', 'error': 'No historical data available'}
             
-        current_price = hist['Close'].iloc[-1]
-        previous_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+        # Get price data from the specified interval
+        price_data = data_by_interval[price_interval]
+        current_price = price_data['Close'].iloc[-1]
+        previous_close = price_data['Close'].iloc[-2] if len(price_data) > 1 else current_price
         
         change = current_price - previous_close
         change_percent = (change / previous_close) * 100 if previous_close != 0 else 0
         
-        # Today's data
+        # Today's data from price interval
         info = stock.info
-        day_high = info.get('dayHigh', hist['High'].iloc[-1])
-        day_low = info.get('dayLow', hist['Low'].iloc[-1])
-        volume = info.get('volume', hist['Volume'].iloc[-1])
+        day_high = info.get('dayHigh', price_data['High'].iloc[-1])
+        day_low = info.get('dayLow', price_data['Low'].iloc[-1])
+        volume = info.get('volume', price_data['Volume'].iloc[-1])
         
-        # Calculate technical indicators
-        sma_20 = hist['Close'].tail(20).mean()
+        # Calculate technical indicators using their specific timeframes
+        
+        # SMA calculation
+        sma_config = timeframes.get("sma", {"interval": "1d", "period": 20})
+        if isinstance(sma_config, dict):
+            sma_interval = sma_config.get("interval", "1d")
+            sma_period = sma_config.get("period", 20)
+        else:
+            sma_interval = sma_config
+            sma_period = 20
+        
+        sma_data = data_by_interval.get(sma_interval)
+        if sma_data is not None and len(sma_data) >= sma_period:
+            sma_20 = sma_data['Close'].tail(sma_period).mean()
+        else:
+            sma_20 = current_price
         
         # RSI calculation
-        rsi = calculate_rsi(hist['Close'].values)
+        rsi_config = timeframes.get("rsi", {"interval": "1d", "period": 14})
+        if isinstance(rsi_config, dict):
+            rsi_interval = rsi_config.get("interval", "1d")
+            rsi_period = rsi_config.get("period", 14)
+        else:
+            rsi_interval = rsi_config
+            rsi_period = 14
         
-        # Volume average (20-day)
-        vol_avg_20 = hist['Volume'].tail(20).mean()
+        rsi_data = data_by_interval.get(rsi_interval)
+        if rsi_data is not None and len(rsi_data) >= rsi_period + 1:
+            rsi = calculate_rsi(rsi_data['Close'].values, period=rsi_period)
+        else:
+            rsi = None
+        
+        # Volume average from price data
+        vol_avg_20 = price_data['Volume'].tail(20).mean()
         vol_ratio = (volume / vol_avg_20) if vol_avg_20 > 0 else 1
         
         # Distance from high/low as percentage
@@ -274,19 +380,57 @@ def get_stock_data(symbol, retry_count=0, max_retries=3):
             pct_from_low = 0
         
         # VWAP calculation
-        vwap = calculate_vwap(hist)
-        vwap_distance = ((current_price - vwap) / vwap * 100) if vwap else None
+        vwap_interval = timeframes.get("vwap", price_interval)
+        vwap_data = data_by_interval.get(vwap_interval)
+        if vwap_data is not None:
+            vwap = calculate_vwap(vwap_data)
+            vwap_distance = ((current_price - vwap) / vwap * 100) if vwap else None
+        else:
+            vwap = None
+            vwap_distance = None
         
         # Trend strength
-        trend_slope, trend_strength = calculate_trend_strength(hist['Close'].values)
+        trend_config = timeframes.get("trend", {"interval": "1d", "period": 20})
+        if isinstance(trend_config, dict):
+            trend_interval = trend_config.get("interval", "1d")
+            trend_period = trend_config.get("period", 20)
+        else:
+            trend_interval = trend_config
+            trend_period = 20
+        
+        trend_data = data_by_interval.get(trend_interval)
+        if trend_data is not None and len(trend_data) >= trend_period:
+            trend_slope, trend_strength = calculate_trend_strength(trend_data['Close'].values, period=trend_period)
+        else:
+            trend_slope, trend_strength = None, None
         
         # Bar pattern
-        open_price = hist['Open'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else None
-        bar_pattern = identify_bar_pattern(open_price, day_high, day_low, current_price, prev_close)
+        pattern_interval = timeframes.get("patterns", price_interval)
+        pattern_data = data_by_interval.get(pattern_interval)
+        if pattern_data is not None and len(pattern_data) > 0:
+            open_price = pattern_data['Open'].iloc[-1]
+            pattern_high = pattern_data['High'].iloc[-1]
+            pattern_low = pattern_data['Low'].iloc[-1]
+            pattern_close = pattern_data['Close'].iloc[-1]
+            prev_close = pattern_data['Close'].iloc[-2] if len(pattern_data) > 1 else None
+            bar_pattern = identify_bar_pattern(open_price, pattern_high, pattern_low, pattern_close, prev_close)
+        else:
+            bar_pattern = "Unknown"
         
         # Support and Resistance
-        support, resistance = calculate_support_resistance(hist)
+        sr_config = timeframes.get("support_resistance", {"interval": "1d", "lookback": 20})
+        if isinstance(sr_config, dict):
+            sr_interval = sr_config.get("interval", "1d")
+            sr_lookback = sr_config.get("lookback", 20)
+        else:
+            sr_interval = sr_config
+            sr_lookback = 20
+        
+        sr_data = data_by_interval.get(sr_interval)
+        if sr_data is not None and len(sr_data) >= sr_lookback:
+            support, resistance = calculate_support_resistance(sr_data, lookback=sr_lookback)
+        else:
+            support, resistance = None, None
         
         return {
             'symbol': symbol,
@@ -321,7 +465,7 @@ def get_stock_data(symbol, retry_count=0, max_retries=3):
         if retry_count < max_retries:
             log_error(f"{error_msg}, retry {retry_count + 1}/{max_retries} in {retry_delay}s", console_output=False)
             time.sleep(retry_delay)
-            return get_stock_data(symbol, retry_count + 1, max_retries)
+            return get_stock_data(symbol, retry_count + 1, max_retries, timeframes)
         
         log_error(f"{error_msg} after {max_retries} retries")
         return {'symbol': symbol, 'status': 'NETWORK_ERROR', 'error': error_type, 'message': str(e)}
@@ -340,7 +484,7 @@ def get_stock_data(symbol, retry_count=0, max_retries=3):
         if retry_count < max_retries:
             log_error(f"{error_msg}, retry {retry_count + 1}/{max_retries} in {retry_delay}s", console_output=False)
             time.sleep(retry_delay)
-            return get_stock_data(symbol, retry_count + 1, max_retries)
+            return get_stock_data(symbol, retry_count + 1, max_retries, timeframes)
         
         log_error(f"{error_msg} after {max_retries} retries")
         return {'symbol': symbol, 'status': 'ERROR', 'error': error_type, 'message': str(e)}
@@ -361,7 +505,7 @@ def create_stock_tables(stocks_data):
     """Create two rich tables with stock data"""
     # First table: Price and Volume
     price_table = Table(
-        title="📈 Price & Volume",
+        title="Price & Volume",
         box=box.ROUNDED,
         show_header=True,
         header_style="bold cyan",
@@ -379,7 +523,7 @@ def create_stock_tables(stocks_data):
     
     # Second table: Technical Indicators
     tech_table = Table(
-        title="📊 Technical Indicators",
+        title="Technical Indicators",
         box=box.ROUNDED,
         show_header=True,
         header_style="bold magenta",
@@ -423,7 +567,7 @@ def create_stock_tables(stocks_data):
         # Format values for price table
         is_up = data['change'] >= 0
         change_color = "green" if is_up else "red"
-        arrow = "▲" if is_up else "▼"
+        arrow = "^" if is_up else "v"
         
         price_str = f"${data['current_price']:.2f}"
         change_str = f"[{change_color}]{arrow} ${abs(data['change']):.2f}[/{change_color}]"
@@ -485,11 +629,11 @@ def create_stock_tables(stocks_data):
         trend_strength = data.get('trend_strength', 0)
         
         if trend_slope and trend_slope > 0.5:
-            trend_str = "[green]↗ UP[/green]"
+            trend_str = "[green]/ UP[/green]"
         elif trend_slope and trend_slope < -0.5:
-            trend_str = "[red]↘ DOWN[/red]"
+            trend_str = "[red]\\ DOWN[/red]"
         else:
-            trend_str = "[yellow]→ FLAT[/yellow]"
+            trend_str = "[yellow]- FLAT[/yellow]"
         
         if trend_strength:
             strength_str = f"{trend_strength:.1f}%"
@@ -511,7 +655,7 @@ def create_stock_tables(stocks_data):
         pct_from_high = data.get('pct_from_high', 0)
         pct_from_low = data.get('pct_from_low', 0)
         range_position = (pct_from_low / (pct_from_low + pct_from_high) * 100) if (pct_from_low + pct_from_high) > 0 else 50
-        range_str = f"{range_position:.0f}% [dim]({pct_from_low:.1f}↑/{pct_from_high:.1f}↓)[/dim]"
+        range_str = f"{range_position:.0f}% [dim]({pct_from_low:.1f}^/{pct_from_high:.1f}v)[/dim]"
         
         # Add row to technical table
         tech_table.add_row(
@@ -552,9 +696,9 @@ def create_status_bar(config, alerts_count, last_update, paused, connection_stat
     
     # Connection status
     if connection_status:
-        status_items.append("[green]● Connected[/green]")
+        status_items.append("[green]* Connected[/green]")
     else:
-        status_items.append("[red]● Disconnected[/red]")
+        status_items.append("[red]* Disconnected[/red]")
     
     # Paused status
     if paused:
@@ -880,6 +1024,30 @@ def main():
     console.print(create_header())
     console.print(f"[cyan]Monitoring:[/cyan] {', '.join(symbols)}")
     console.print(f"[cyan]Update Interval:[/cyan] {update_interval} seconds")
+    
+    # Display timeframe configuration
+    timeframes = config.get('timeframes', {})
+    if timeframes:
+        console.print("[cyan]Timeframes:[/cyan]")
+        console.print(f"  Price: {timeframes.get('price', '1d')}")
+        
+        rsi_cfg = timeframes.get('rsi', '1d')
+        if isinstance(rsi_cfg, dict):
+            console.print(f"  RSI: {rsi_cfg.get('interval', '1d')} (period: {rsi_cfg.get('period', 14)})")
+        else:
+            console.print(f"  RSI: {rsi_cfg}")
+            
+        sma_cfg = timeframes.get('sma', '1d')
+        if isinstance(sma_cfg, dict):
+            console.print(f"  SMA: {sma_cfg.get('interval', '1d')} (period: {sma_cfg.get('period', 20)})")
+        else:
+            console.print(f"  SMA: {sma_cfg}")
+            
+        console.print(f"  VWAP: {timeframes.get('vwap', timeframes.get('price', '1d'))}")
+        console.print(f"  Patterns: {timeframes.get('patterns', timeframes.get('price', '1d'))}")
+    else:
+        console.print(f"[cyan]Data Interval:[/cyan] {config.get('interval', '1d')}")
+    
     console.print(f"[cyan]Logging:[/cyan] {'Enabled' if logging_enabled else 'Disabled'}")
     console.print(f"[cyan]Market Hours:[/cyan] {config['market_hours']['open_time']} - {config['market_hours']['close_time']} ET")
     console.print(f"[cyan]Alerts:[/cyan] {len(alerts)} stocks configured")
@@ -1027,7 +1195,8 @@ def main():
                 
                 for symbol in symbols:
                     progress.update(task, advance=1, description=f"[cyan]Fetching {symbol}...")
-                    data = get_stock_data(symbol)
+                    timeframes = config.get('timeframes', None)
+                    data = get_stock_data(symbol, timeframes=timeframes)
                     stocks_data.append(data)
                     
                     # Track errors
