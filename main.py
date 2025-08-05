@@ -6,6 +6,8 @@ import csv
 import json
 from datetime import datetime
 import pytz
+import pandas as pd
+import numpy as np
 from colorama import init, Fore, Style, Back
 
 init(autoreset=True)
@@ -15,24 +17,71 @@ def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return None
+    
+    deltas = np.diff(prices)
+    gains = deltas.copy()
+    losses = deltas.copy()
+    gains[gains < 0] = 0
+    losses[losses > 0] = 0
+    losses = abs(losses)
+    
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    
+    if avg_loss == 0:
+        return 100
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
 def get_stock_data(symbol):
     try:
         stock = yf.Ticker(symbol)
         
-        hist = stock.history(period="2d")
-        if hist.empty:
+        # Fetch 30 days of data for technical indicators
+        hist = stock.history(period="1mo")
+        if hist.empty or len(hist) < 20:
             return None
             
         current_price = hist['Close'].iloc[-1]
-        previous_close = hist['Close'].iloc[0] if len(hist) > 1 else current_price
+        previous_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
         
         change = current_price - previous_close
         change_percent = (change / previous_close) * 100 if previous_close != 0 else 0
         
+        # Today's data
         info = stock.info
         day_high = info.get('dayHigh', hist['High'].iloc[-1])
         day_low = info.get('dayLow', hist['Low'].iloc[-1])
         volume = info.get('volume', hist['Volume'].iloc[-1])
+        
+        # Calculate technical indicators
+        sma_20 = hist['Close'].tail(20).mean()
+        
+        # RSI calculation
+        rsi = calculate_rsi(hist['Close'].values)
+        
+        # Volume average (20-day)
+        vol_avg_20 = hist['Volume'].tail(20).mean()
+        vol_ratio = (volume / vol_avg_20) if vol_avg_20 > 0 else 1
+        
+        # Distance from high/low as percentage
+        day_range = day_high - day_low
+        if day_range > 0:
+            pct_from_high = ((day_high - current_price) / day_high) * 100
+            pct_from_low = ((current_price - day_low) / day_low) * 100
+        else:
+            pct_from_high = 0
+            pct_from_low = 0
         
         return {
             'symbol': symbol,
@@ -43,6 +92,11 @@ def get_stock_data(symbol):
             'day_high': day_high,
             'day_low': day_low,
             'volume': volume,
+            'sma_20': sma_20,
+            'rsi': rsi,
+            'vol_ratio': vol_ratio,
+            'pct_from_high': pct_from_high,
+            'pct_from_low': pct_from_low,
             'timestamp': datetime.now()
         }
         
@@ -62,23 +116,23 @@ def format_number(num):
 
 
 def display_header():
-    print(f"\n{Fore.CYAN}{'=' * 90}")
-    print(f"{Fore.WHITE}{Style.BRIGHT}{'STOCK MARKET MONITOR':^90}")
-    print(f"{Fore.CYAN}{'=' * 90}")
+    print(f"\n{Fore.CYAN}{'=' * 150}")
+    print(f"{Fore.WHITE}{Style.BRIGHT}{'STOCK MARKET MONITOR WITH TECHNICAL INDICATORS':^150}")
+    print(f"{Fore.CYAN}{'=' * 150}")
     print(f"{Fore.WHITE}Last Update: {Fore.YELLOW}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{Fore.CYAN}{'-' * 90}\n")
+    print(f"{Fore.CYAN}{'-' * 150}\n")
 
 
 def display_table_header():
-    headers = ['Symbol', 'Price', 'Change', '% Change', 'Volume', 'Day Range', 'Current Position']
-    widths = [8, 10, 10, 10, 12, 20, 20]
+    headers = ['Symbol', 'Price', 'Change', '%Chg', 'SMA(20)', 'RSI(14)', 'Vol/Avg', 'Range', '%High', '%Low']
+    widths = [8, 10, 10, 8, 10, 8, 8, 18, 8, 8]
     
     header_line = ""
     for header, width in zip(headers, widths):
         header_line += f"{Fore.WHITE}{Style.BRIGHT}{header:^{width}}"
     
     print(header_line)
-    print(f"{Fore.CYAN}{'-' * 90}")
+    print(f"{Fore.CYAN}{'-' * 150}")
 
 
 def display_stock_row(data):
@@ -89,32 +143,55 @@ def display_stock_row(data):
     color = Fore.GREEN if is_up else Fore.RED
     arrow = "^" if is_up else "v"
     
-    # Format values
+    # Format basic values
     symbol = f"{Fore.WHITE}{Style.BRIGHT}{data['symbol']:<8}"
     price = f"{Fore.WHITE}${data['current_price']:>8.2f}"
     
     change_sign = "+" if is_up else ""
     change = f"{color}{arrow} {change_sign}${abs(data['change']):>6.2f}"
-    percent = f"{color}{change_sign}{data['change_percent']:>6.2f}%"
+    percent = f"{color}{change_sign}{data['change_percent']:>5.2f}%"
     
-    volume = f"{Fore.WHITE}{format_number(data['volume']):>12}"
+    # Format SMA
+    sma = f"{Fore.WHITE}${data['sma_20']:>8.2f}"
+    
+    # Format RSI with color coding
+    rsi_val = data['rsi']
+    if rsi_val is not None:
+        if rsi_val >= 70:
+            rsi_color = Fore.RED  # Overbought
+        elif rsi_val <= 30:
+            rsi_color = Fore.GREEN  # Oversold
+        else:
+            rsi_color = Fore.WHITE
+        rsi = f"{rsi_color}{rsi_val:>6.1f}"
+    else:
+        rsi = f"{Fore.WHITE}{'N/A':>6}"
+    
+    # Volume ratio
+    vol_ratio = data['vol_ratio']
+    if vol_ratio >= 1.5:
+        vol_color = Fore.YELLOW  # High volume
+    elif vol_ratio <= 0.5:
+        vol_color = Fore.CYAN  # Low volume
+    else:
+        vol_color = Fore.WHITE
+    vol_str = f"{vol_color}{vol_ratio:>6.2f}x"
+    
+    # Day range
     day_range = f"{Fore.WHITE}${data['day_low']:.2f}-${data['day_high']:.2f}"
     
-    # Calculate position in day range
-    day_range_val = data['day_high'] - data['day_low']
-    if day_range_val > 0:
-        position = (data['current_price'] - data['day_low']) / day_range_val
-        bar_length = 15
-        filled = int(position * bar_length)
-        position_bar = f"{Fore.BLUE}[{color}{'#' * filled}{Fore.WHITE}{'-' * (bar_length - filled)}{Fore.BLUE}]"
-    else:
-        position_bar = f"{Fore.BLUE}[{Fore.WHITE}{'-' * 15}{Fore.BLUE}]"
+    # Distance from high/low
+    pct_high = f"{Fore.RED}{data['pct_from_high']:>6.2f}%"
+    pct_low = f"{Fore.GREEN}{data['pct_from_low']:>6.2f}%"
     
-    print(f"{symbol} {price} {change} {percent} {volume} {day_range:<20} {position_bar}")
+    # Headers: ['Symbol', 'Price', 'Change', '%Chg', 'SMA(20)', 'RSI(14)', 'Vol/Avg', 'Range', '%High', '%Low']
+    # Widths:  [8, 10, 10, 8, 10, 8, 8, 18, 8, 8]
+    
+    print(f"{symbol} {price} {change} {percent} {sma} {rsi} {vol_str} {day_range:<18} {pct_high} {pct_low}")
 
 
 def display_footer():
-    print(f"\n{Fore.CYAN}{'=' * 90}\n")
+    print(f"\n{Fore.CYAN}{'=' * 150}\n")
 
 
 def log_to_csv(data, log_dir):
@@ -130,7 +207,9 @@ def log_to_csv(data, log_dir):
     
     # Write data to CSV
     with open(filename, 'a', newline='') as csvfile:
-        fieldnames = ['timestamp', 'symbol', 'price', 'volume', 'change', 'change_percent', 'day_high', 'day_low']
+        fieldnames = ['timestamp', 'symbol', 'price', 'volume', 'change', 'change_percent', 
+                     'day_high', 'day_low', 'sma_20', 'rsi_14', 'volume_ratio', 
+                     'pct_from_high', 'pct_from_low']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         # Write header if file is new
@@ -146,7 +225,12 @@ def log_to_csv(data, log_dir):
             'change': data['change'],
             'change_percent': data['change_percent'],
             'day_high': data['day_high'],
-            'day_low': data['day_low']
+            'day_low': data['day_low'],
+            'sma_20': data['sma_20'],
+            'rsi_14': data['rsi'] if data['rsi'] is not None else '',
+            'volume_ratio': data['vol_ratio'],
+            'pct_from_high': data['pct_from_high'],
+            'pct_from_low': data['pct_from_low']
         })
 
 

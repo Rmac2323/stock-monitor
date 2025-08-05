@@ -3,7 +3,13 @@
         "AAPL",
         "GOOGL",
         "MSFT",
-        "AMZN"
+        "AMZN",
+        "TSLA",
+        "NVDA",
+        "SPY",
+        "QQQ",
+        "IWM",
+        "DIA"
     ],
     "update_interval": 5,
     "logging": {
